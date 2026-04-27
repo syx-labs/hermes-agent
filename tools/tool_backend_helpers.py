@@ -123,7 +123,7 @@ def prefers_gateway(config_section: str) -> bool:
     return False
 
 
-def fal_key_is_configured() -> bool:
+def fal_key_configured() -> bool:
     """Return True when FAL_KEY is set to a non-whitespace value.
 
     Consults both ``os.environ`` and ``~/.hermes/.env`` (via
@@ -142,3 +142,8 @@ def fal_key_is_configured() -> bool:
         except Exception:
             value = None
     return bool(value and value.strip())
+
+
+def fal_key_is_configured() -> bool:
+    """Backward-compatible alias for older callers expecting the legacy name."""
+    return fal_key_configured()

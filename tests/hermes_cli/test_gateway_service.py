@@ -44,6 +44,7 @@ class TestSystemdServiceRefresh:
 
         monkeypatch.setattr(gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path)
         monkeypatch.setattr(gateway_cli, "generate_systemd_unit", lambda system=False, run_as_user=None: "new unit\n")
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
 
         calls = []
 
@@ -67,6 +68,7 @@ class TestSystemdServiceRefresh:
 
         monkeypatch.setattr(gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path)
         monkeypatch.setattr(gateway_cli, "generate_systemd_unit", lambda system=False, run_as_user=None: "new unit\n")
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
 
         calls = []
 
@@ -465,6 +467,7 @@ class TestGatewaySystemServiceRouting:
         calls = []
 
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: calls.append(("refresh", system)))
         monkeypatch.setattr(
             "gateway.status.get_running_pid",
@@ -519,6 +522,7 @@ class TestGatewaySystemServiceRouting:
 
     def test_systemd_restart_recovers_failed_planned_restart(self, monkeypatch, capsys):
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None)
         monkeypatch.setattr(
             "gateway.status.read_runtime_status",
@@ -732,6 +736,47 @@ class TestGatewaySystemServiceRouting:
         assert "service stopped" in out
         assert "Gateway process is running for this profile" in out
         assert "PID(s): 4321" in out
+
+    def test_gateway_status_uses_legacy_launchd_service_for_profile(self, tmp_path, monkeypatch, capsys):
+        legacy_plist = tmp_path / "Library" / "LaunchAgents" / "ai.hermes.gateway.plist"
+        legacy_plist.parent.mkdir(parents=True, exist_ok=True)
+        legacy_plist.write_text("plist\n", encoding="utf-8")
+
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: tmp_path)
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: tmp_path / "Library" / "LaunchAgents" / "ai.hermes.gateway-friday.plist")
+        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway-friday")
+        monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: False)
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_gateway_runtime_snapshot",
+            lambda system=False: gateway_cli.GatewayRuntimeSnapshot(
+                manager="launchd",
+                service_installed=True,
+                service_running=True,
+                gateway_pids=(76324,),
+                service_scope="launchd",
+            ),
+        )
+
+        def fake_run(cmd, capture_output=False, text=False, timeout=None, **kwargs):
+            if cmd == ["launchctl", "list", "ai.hermes.gateway-friday"]:
+                return SimpleNamespace(returncode=113, stdout="", stderr="Could not find service")
+            if cmd == ["launchctl", "list", "ai.hermes.gateway"]:
+                return SimpleNamespace(returncode=0, stdout="76324\t0\tai.hermes.gateway\n", stderr="")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        gateway_cli.gateway_command(SimpleNamespace(gateway_command="status", deep=False, system=False))
+
+        out = capsys.readouterr().out
+        assert "Launchd plist:" in out
+        assert "ai.hermes.gateway.plist" in out
+        assert "Using legacy unscoped launchd label" in out
+        assert "Running manually, not as a system service" not in out
 
     def test_gateway_status_on_termux_shows_manual_guidance(self, monkeypatch, capsys):
         monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)

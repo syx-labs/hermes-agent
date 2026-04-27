@@ -43,6 +43,69 @@ class TestGatewayPidState:
         payload = json.loads((tmp_path / "gateway.pid").read_text())
         assert payload["pid"] == os.getpid()
 
+    def test_write_pid_file_replaces_stale_pid_file_once(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        stale_pid = 424242
+        (tmp_path / "gateway.pid").write_text(json.dumps({
+            "pid": stale_pid,
+            "kind": "hermes-gateway",
+            "argv": ["python", "-m", "hermes_cli.main", "gateway"],
+            "start_time": 111,
+        }))
+
+        def fake_kill(pid, sig):
+            if pid == stale_pid:
+                raise ProcessLookupError
+            return None
+
+        monkeypatch.setattr(status.os, "kill", fake_kill)
+
+        status.write_pid_file()
+
+        payload = json.loads((tmp_path / "gateway.pid").read_text())
+        assert payload["pid"] == os.getpid()
+        assert payload["kind"] == "hermes-gateway"
+
+    def test_write_pid_file_keeps_existing_pid_on_permission_error(self, tmp_path, monkeypatch):
+        import pytest
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        protected_pid = 424243
+        original = {
+            "pid": protected_pid,
+            "kind": "hermes-gateway",
+            "argv": ["python", "-m", "hermes_cli.main", "gateway"],
+            "start_time": 111,
+        }
+        (tmp_path / "gateway.pid").write_text(json.dumps(original))
+
+        def fake_kill(pid, sig):
+            if pid == protected_pid:
+                raise PermissionError
+            return None
+
+        monkeypatch.setattr(status.os, "kill", fake_kill)
+
+        with pytest.raises(FileExistsError):
+            status.write_pid_file()
+
+        payload = json.loads((tmp_path / "gateway.pid").read_text())
+        assert payload == original
+
+    def test_get_process_start_time_uses_ps_fallback_on_macos(self, monkeypatch):
+        monkeypatch.setattr(status.sys, "platform", "darwin", raising=False)
+
+        def fake_run(cmd, capture_output=False, text=False, timeout=None, check=False):
+            assert cmd[:3] == ["ps", "-o", "lstart="]
+            return SimpleNamespace(returncode=0, stdout="Tue Apr 22 06:46:51 2026\n", stderr="")
+
+        monkeypatch.setattr(status.subprocess, "run", fake_run)
+
+        start = status._get_process_start_time(12345)
+
+        assert isinstance(start, int)
+        assert start > 0
+
     def test_get_running_pid_rejects_live_non_gateway_pid(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         pid_path = tmp_path / "gateway.pid"

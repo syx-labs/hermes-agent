@@ -99,25 +99,25 @@ def _get_service_pids() -> set:
 
     # --- launchd (macOS) ---
     if is_macos():
-        try:
-            label = get_launchd_label()
-            result = subprocess.run(
-                ["launchctl", "list", label],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode == 0:
-                # Output: "PID\tStatus\tLabel" header, then one data line
-                for line in result.stdout.strip().splitlines():
-                    parts = line.split()
-                    if len(parts) >= 3 and parts[2] == label:
-                        try:
-                            pid = int(parts[0])
-                            if pid > 0:
-                                pids.add(pid)
-                        except ValueError:
-                            pass
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
+        for label, _plist_path, _is_legacy in _launchd_service_candidates():
+            try:
+                result = subprocess.run(
+                    ["launchctl", "list", label],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0:
+                    # Output: "PID\tStatus\tLabel" header, then one data line
+                    for line in result.stdout.strip().splitlines():
+                        parts = line.split()
+                        if len(parts) >= 3 and parts[2] == label:
+                            try:
+                                pid = int(parts[0])
+                                if pid > 0:
+                                    pids.add(pid)
+                            except ValueError:
+                                pass
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
 
     return pids
 
@@ -529,18 +529,21 @@ def _recover_pending_systemd_restart(system: bool = False, previous_pid: int | N
 
 
 def _probe_launchd_service_running() -> bool:
-    if not get_launchd_plist_path().exists():
-        return False
-    try:
-        result = subprocess.run(
-            ["launchctl", "list", get_launchd_label()],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except subprocess.TimeoutExpired:
-        return False
-    return result.returncode == 0
+    for label, plist_path, _is_legacy in _launchd_service_candidates():
+        if not plist_path.exists():
+            continue
+        try:
+            result = subprocess.run(
+                ["launchctl", "list", label],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except subprocess.TimeoutExpired:
+            continue
+        if result.returncode == 0:
+            return True
+    return False
 
 
 def get_gateway_runtime_snapshot(system: bool = False) -> GatewayRuntimeSnapshot:
@@ -574,7 +577,7 @@ def get_gateway_runtime_snapshot(system: bool = False) -> GatewayRuntimeSnapshot
     if is_macos():
         return GatewayRuntimeSnapshot(
             manager="launchd",
-            service_installed=get_launchd_plist_path().exists(),
+            service_installed=_launchd_service_installed(),
             service_running=_probe_launchd_service_running(),
             gateway_pids=gateway_pids,
             service_scope="launchd",
@@ -2005,6 +2008,30 @@ def get_launchd_label() -> str:
     return f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
 
 
+def _launchd_service_candidates() -> list[tuple[str, Path, bool]]:
+    """Return launchd labels/plists that may manage the current profile.
+
+    Supports the current profile-scoped label first, then falls back to the
+    legacy unscoped ``ai.hermes.gateway`` service so status/probe commands keep
+    working across upgrades from pre-profile launchd installs.
+    """
+    current_label = get_launchd_label()
+    current_path = get_launchd_plist_path()
+    candidates: list[tuple[str, Path, bool]] = [(current_label, current_path, False)]
+
+    legacy_label = "ai.hermes.gateway"
+    legacy_path = _launchd_user_home() / "Library" / "LaunchAgents" / f"{legacy_label}.plist"
+    if current_label != legacy_label:
+        candidates.append((legacy_label, legacy_path, True))
+
+    return candidates
+
+
+def _launchd_service_installed() -> bool:
+    """Return True when a current or legacy launchd plist exists."""
+    return any(plist_path.exists() for _label, plist_path, _is_legacy in _launchd_service_candidates())
+
+
 def _launchd_domain() -> str:
     return f"gui/{os.getuid()}"
 
@@ -2283,30 +2310,50 @@ def launchd_restart():
         print("✓ Service restarted")
 
 def launchd_status(deep: bool = False):
-    plist_path = get_launchd_plist_path()
-    label = get_launchd_label()
-    try:
-        result = subprocess.run(
-            ["launchctl", "list", label],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        loaded = result.returncode == 0
-        loaded_output = result.stdout
-    except subprocess.TimeoutExpired:
-        loaded = False
-        loaded_output = ""
+    selected_label = get_launchd_label()
+    selected_plist = get_launchd_plist_path()
+    loaded = False
+    loaded_output = ""
+    using_legacy = False
 
-    print(f"Launchd plist: {plist_path}")
-    if launchd_plist_is_current():
+    for label, plist_path, is_legacy in _launchd_service_candidates():
+        try:
+            result = subprocess.run(
+                ["launchctl", "list", label],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                selected_label = label
+                selected_plist = plist_path
+                loaded = True
+                loaded_output = result.stdout
+                using_legacy = is_legacy
+                break
+        except subprocess.TimeoutExpired:
+            continue
+        if selected_plist == get_launchd_plist_path() and plist_path.exists():
+            selected_label = label
+            selected_plist = plist_path
+            using_legacy = is_legacy
+
+    print(f"Launchd plist: {selected_plist}")
+    if using_legacy:
+        print("⚠ Using legacy unscoped launchd label for this profile")
+        print("  Run: hermes gateway install  # migrate to a profile-scoped LaunchAgent")
+
+    if selected_plist.exists() and launchd_plist_is_current():
         print("✓ Service definition matches the current Hermes install")
-    else:
+    elif selected_plist.exists():
         print("⚠ Service definition is stale relative to the current Hermes install")
         print("  Run: hermes gateway start")
+    else:
+        print("✗ Service definition is missing")
+        print("  Run: hermes gateway install")
 
     if loaded:
-        print("✓ Gateway service is loaded")
+        print(f"✓ Gateway service is loaded ({selected_label})")
         print(loaded_output)
     else:
         print("✗ Gateway service is not loaded")
@@ -4175,7 +4222,7 @@ def _gateway_command_inner(args):
         if supports_systemd_services() and (get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()):
             systemd_status(deep, system=system, full=full)
             _print_gateway_process_mismatch(snapshot)
-        elif is_macos() and get_launchd_plist_path().exists():
+        elif is_macos() and _launchd_service_installed():
             launchd_status(deep)
             _print_gateway_process_mismatch(snapshot)
         else:

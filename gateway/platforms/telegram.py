@@ -84,6 +84,8 @@ from gateway.platforms.telegram_network import (
     discover_fallback_ips,
     parse_fallback_ip_env,
 )
+from gateway.cockpit.actions import CockpitActionStore, SafetyLevel, is_cockpit_callback, parse_cockpit_callback
+from gateway.cockpit.keyboards import CockpitKeyboardSpec
 
 
 def check_telegram_requirements() -> bool:
@@ -251,6 +253,8 @@ class TelegramAdapter(BasePlatformAdapter):
         self._model_picker_state: Dict[str, dict] = {}
         # Approval button state: message_id → session_key
         self._approval_state: Dict[int, str] = {}
+        # Telegram Cockpit inline action state: cx:<id> → CockpitAction
+        self._cockpit_action_store = CockpitActionStore()
 
     @staticmethod
     def _is_callback_user_authorized(user_id: str) -> bool:
@@ -267,6 +271,33 @@ class TelegramAdapter(BasePlatformAdapter):
             return None
         thread_id = metadata.get("thread_id") or metadata.get("message_thread_id")
         return str(thread_id) if thread_id is not None else None
+
+    @staticmethod
+    def _metadata_reply_markup(metadata: Optional[Dict[str, Any]]) -> Any:
+        """Build Telegram inline keyboard markup from cockpit metadata."""
+        if not metadata:
+            return None
+        keyboard = metadata.get("cockpit_keyboard") or metadata.get("reply_markup")
+        if not keyboard:
+            return None
+        markup_type = InlineKeyboardMarkup if isinstance(InlineKeyboardMarkup, type) else None
+        if markup_type and isinstance(keyboard, markup_type):
+            return keyboard
+        if isinstance(keyboard, CockpitKeyboardSpec):
+            rows = keyboard.rows
+        else:
+            rows = getattr(keyboard, "rows", ())
+        rendered_rows = []
+        for row in rows or ():
+            rendered_row = []
+            for button in row or ():
+                label = getattr(button, "label", None) or getattr(button, "text", None)
+                callback_data = getattr(button, "callback_data", None)
+                if label and callback_data:
+                    rendered_row.append(InlineKeyboardButton(str(label), callback_data=str(callback_data)))
+            if rendered_row:
+                rendered_rows.append(rendered_row)
+        return InlineKeyboardMarkup(rendered_rows) if rendered_rows else None
 
     @classmethod
     def _message_thread_id_for_send(cls, thread_id: Optional[str]) -> Optional[int]:
@@ -999,6 +1030,7 @@ class TelegramAdapter(BasePlatformAdapter):
             
             message_ids = []
             thread_id = self._metadata_thread_id(metadata)
+            reply_markup = self._metadata_reply_markup(metadata)
             
             try:
                 from telegram.error import NetworkError as _NetErr
@@ -1031,6 +1063,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 parse_mode=ParseMode.MARKDOWN_V2,
                                 reply_to_message_id=reply_to_id,
                                 message_thread_id=effective_thread_id,
+                                reply_markup=reply_markup if i == 0 else None,
                                 **self._link_preview_kwargs(),
                             )
                         except Exception as md_error:
@@ -1044,6 +1077,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     parse_mode=None,
                                     reply_to_message_id=reply_to_id,
                                     message_thread_id=effective_thread_id,
+                                    reply_markup=reply_markup if i == 0 else None,
                                     **self._link_preview_kwargs(),
                                 )
                             else:
@@ -1626,6 +1660,147 @@ class TelegramAdapter(BasePlatformAdapter):
             # Catch-all (e.g. page counter button "mx:noop")
             await query.answer()
 
+    def _cockpit_confirmation_markup(self, action):
+        """Build a two-button confirmation keyboard for a pending Cockpit action."""
+        payload = {"action_id": action.id}
+        kwargs = {"chat_id": action.chat_id, "user_id": action.user_id}
+        confirm = self._cockpit_action_store.create(kind="cockpit.confirm", payload=payload, **kwargs)
+        cancel = self._cockpit_action_store.create(kind="cockpit.cancel", payload=payload, **kwargs)
+        rows = [
+            [
+                InlineKeyboardButton("Confirm", callback_data=f"cx:{confirm.id}"),
+                InlineKeyboardButton("Cancel", callback_data=f"cx:{cancel.id}"),
+            ]
+        ]
+        return InlineKeyboardMarkup(rows)
+
+    @staticmethod
+    def _command_for_cockpit_action(action) -> str | None:
+        """Translate a server-side cockpit action into a gateway command."""
+        payload = dict(getattr(action, "payload", {}) or {})
+        kind = str(getattr(action, "kind", "") or "")
+        if kind.startswith("cron."):
+            verb = kind.removeprefix("cron.")
+            if verb in {"create", "docs"}:
+                return f"/jobs {verb}"
+            job_id = str(payload.get("job_id") or "").strip()
+            return f"/jobs {verb} {job_id}".strip() if job_id else None
+        if kind.startswith("project."):
+            verb = kind.removeprefix("project.")
+            project = str(payload.get("project") or "").strip()
+            return f"/projects {verb} {project}".strip() if project else None
+        if kind in {"newtask.select", "research.select", "review.select"}:
+            flow = kind.split(".", 1)[0]
+            step = str(payload.get("step") or "").strip()
+            value = str(payload.get("value") or "").strip()
+            return f"/{flow} {step} {value}".strip() if step and value else None
+        if kind in {"newtask.confirm", "research.confirm", "review.confirm"}:
+            flow = kind.split(".", 1)[0]
+            return f"/{flow} confirm"
+        return None
+
+    async def _handle_cockpit_callback(self, query, data: str) -> None:
+        """Handle generic Telegram Cockpit callbacks in the cx: namespace."""
+        action_id = parse_cockpit_callback(data)
+        if not action_id:
+            await query.answer(text="Cockpit action expired — please run the command again.")
+            return
+
+        action = self._cockpit_action_store.get(action_id)
+        if not action:
+            await query.answer(text="Cockpit action expired — please run the command again.")
+            return
+        callback_action_id = action_id
+
+        caller_id = str(getattr(query.from_user, "id", ""))
+        chat_id = str(query.message.chat_id) if query.message else None
+        if not self._is_callback_user_authorized(caller_id):
+            await query.answer(text="⛔ You are not authorized to use this action.")
+            return
+        if action.user_id and caller_id != action.user_id:
+            await query.answer(text="⛔ You are not authorized to use this action.")
+            return
+        if action.chat_id and chat_id != action.chat_id:
+            await query.answer(text="⛔ This action belongs to another chat.")
+            return
+
+        if action.kind == "cockpit.cancel":
+            original_id = str(action.payload.get("action_id") or "").strip()
+            self._cockpit_action_store.consume(action_id)
+            if original_id:
+                self._cockpit_action_store.consume(original_id)
+            await query.answer(text="Action cancelled")
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+
+        if action.kind == "cockpit.confirm":
+            original_id = str(action.payload.get("action_id") or "").strip()
+            original = self._cockpit_action_store.get(original_id)
+            if not original:
+                self._cockpit_action_store.consume(action_id)
+                await query.answer(text="Cockpit action expired — please run the command again.")
+                return
+            action = original
+            action_id = original_id
+            if action.user_id and caller_id != action.user_id:
+                await query.answer(text="⛔ You are not authorized to use this action.")
+                return
+            if action.chat_id and chat_id != action.chat_id:
+                await query.answer(text="⛔ This action belongs to another chat.")
+                return
+        elif action.safety_level == SafetyLevel.SENSITIVE or (
+            action.safety_level == SafetyLevel.CONFIRM and not action.kind.endswith(".confirm")
+        ):
+            try:
+                await query.edit_message_reply_markup(reply_markup=self._cockpit_confirmation_markup(action))
+            except Exception:
+                pass
+            await query.answer(text="Please confirm this action.")
+            return
+
+        command = self._command_for_cockpit_action(action)
+        if not command or not chat_id:
+            await query.answer(text=f"Action not implemented yet: {action.kind}")
+            return
+        if not self._message_handler:
+            await query.answer(text="Gateway is not ready for this action.")
+            return
+
+        self._cockpit_action_store.consume(action_id)
+        if callback_action_id != action_id:
+            self._cockpit_action_store.consume(callback_action_id)
+        await query.answer(text="Action received")
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        from gateway.session import SessionSource
+
+        message = query.message
+        from_user = query.from_user
+        thread_id = getattr(message, "message_thread_id", None)
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id=chat_id,
+            chat_type="dm" if str(getattr(getattr(message, "chat", None), "type", "")) == "private" else "group",
+            user_id=caller_id,
+            user_name=getattr(from_user, "username", None) or getattr(from_user, "first_name", None),
+            thread_id=str(thread_id) if thread_id is not None else None,
+            message_id=str(getattr(message, "message_id", "") or ""),
+        )
+        event = MessageEvent(
+            text=command,
+            message_type=MessageType.COMMAND,
+            source=source,
+            raw_message=message,
+            message_id=str(getattr(message, "message_id", "") or ""),
+        )
+        await self.handle_message(event)
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -1634,6 +1809,11 @@ class TelegramAdapter(BasePlatformAdapter):
         if not query or not query.data:
             return
         data = query.data
+
+        # --- Telegram Cockpit callbacks (cx:<action_id>) ---
+        if is_cockpit_callback(data):
+            await self._handle_cockpit_callback(query, data)
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mm:", "mb", "mx", "mg:")):

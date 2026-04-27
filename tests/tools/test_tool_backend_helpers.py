@@ -7,6 +7,7 @@ Tests cover:
 - has_direct_modal_credentials() detection
 - resolve_modal_backend_state() backend selection matrix
 - resolve_openai_audio_api_key() priority chain
+- fal_key_is_configured() backward-compatible alias
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ import pytest
 
 from tools.tool_backend_helpers import (
     coerce_modal_mode,
+    fal_key_configured,
+    fal_key_is_configured,
     has_direct_modal_credentials,
     managed_nous_tools_enabled,
     normalize_browser_cloud_provider,
@@ -30,6 +33,17 @@ from tools.tool_backend_helpers import (
 
 def _raise_import():
     raise ImportError("simulated missing module")
+
+
+# ---------------------------------------------------------------------------
+# FAL key helpers
+# ---------------------------------------------------------------------------
+class TestFalKeyHelpers:
+    """FAL helper aliases should remain backward-compatible."""
+
+    def test_legacy_alias_matches_current_helper(self, monkeypatch):
+        monkeypatch.setenv("FAL_KEY", "test-key")
+        assert fal_key_is_configured() is fal_key_configured()
 
 
 # ---------------------------------------------------------------------------

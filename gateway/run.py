@@ -719,6 +719,12 @@ class GatewayRunner:
         # Key: session_key, Value: {"command": str, "pattern_key": str, ...}
         self._pending_approvals: Dict[str, Dict[str, Any]] = {}
 
+        # Track short-lived Cockpit guided flows such as /newtask.
+        from gateway.cockpit.state import InteractionStateStore
+        self._newtask_state_store = InteractionStateStore()
+        self._research_state_store = InteractionStateStore()
+        self._review_state_store = InteractionStateStore()
+
         # Track platforms that failed to connect for background reconnection.
         # Key: Platform enum, Value: {"config": platform_config, "attempts": int, "next_retry": float}
         self._failed_platforms: Dict[Platform, Dict[str, Any]] = {}
@@ -3583,6 +3589,16 @@ class GatewayRunner:
         if _quick_key in self._running_agents:
             if event.get_command() == "status":
                 return await self._handle_status_command(event)
+            if event.get_command() == "jobs":
+                return await self._handle_jobs_command(event)
+            if event.get_command() == "projects":
+                return await self._handle_projects_command(event)
+            if event.get_command() == "newtask":
+                return await self._handle_newtask_command(event)
+            if event.get_command() == "research":
+                return await self._handle_research_command(event)
+            if event.get_command() == "review":
+                return await self._handle_review_command(event)
 
             # Resolve the command once for all early-intercept checks below.
             from hermes_cli.commands import (
@@ -3745,6 +3761,16 @@ class GatewayRunner:
                     return await self._handle_commands_command(event)
                 if _cmd_def_inner.name == "profile":
                     return await self._handle_profile_command(event)
+                if _cmd_def_inner.name == "jobs":
+                    return await self._handle_jobs_command(event)
+                if _cmd_def_inner.name == "projects":
+                    return await self._handle_projects_command(event)
+                if _cmd_def_inner.name == "newtask":
+                    return await self._handle_newtask_command(event)
+                if _cmd_def_inner.name == "research":
+                    return await self._handle_research_command(event)
+                if _cmd_def_inner.name == "review":
+                    return await self._handle_review_command(event)
                 if _cmd_def_inner.name == "update":
                     return await self._handle_update_command(event)
 
@@ -3936,6 +3962,21 @@ class GatewayRunner:
 
         if canonical == "status":
             return await self._handle_status_command(event)
+
+        if canonical == "jobs":
+            return await self._handle_jobs_command(event)
+
+        if canonical == "projects":
+            return await self._handle_projects_command(event)
+
+        if canonical == "newtask":
+            return await self._handle_newtask_command(event)
+
+        if canonical == "research":
+            return await self._handle_research_command(event)
+
+        if canonical == "review":
+            return await self._handle_review_command(event)
 
         if canonical == "agents":
             return await self._handle_agents_command(event)
@@ -5419,14 +5460,40 @@ class GatewayRunner:
 
     async def _handle_status_command(self, event: MessageEvent) -> str:
         """Handle /status command."""
+        from gateway.cockpit.cards import StatusCard, render_status_card
+        from gateway.cockpit.next_actions import NextAction, NextActionKind
+
         source = event.source
         session_entry = self.session_store.get_or_create_session(source)
-
-        connected_platforms = [p.value for p in self.adapters.keys()]
-
-        # Check if there's an active agent
         session_key = session_entry.session_key
-        is_running = session_key in self._running_agents
+
+        connected_platforms = {p.value for p in self.adapters.keys()}
+        configured_platforms: list[str] = []
+        try:
+            platforms_cfg = getattr(self.config, "platforms", {}) or {}
+            for platform, platform_cfg in platforms_cfg.items():
+                enabled = getattr(platform_cfg, "enabled", True)
+                if enabled:
+                    configured_platforms.append(platform.value if hasattr(platform, "value") else str(platform))
+        except Exception:
+            configured_platforms = []
+
+        connectivity_order: list[str] = []
+        source_platform = source.platform.value if source.platform else ""
+        if source_platform:
+            connectivity_order.append(source_platform)
+        for platform in configured_platforms:
+            if platform not in connectivity_order:
+                connectivity_order.append(platform)
+        for platform in sorted(connected_platforms):
+            if platform not in connectivity_order:
+                connectivity_order.append(platform)
+
+        connectivity_parts: list[str] = []
+        for platform in connectivity_order:
+            state = "connected" if platform in connected_platforms else "configured"
+            connectivity_parts.append(f"{platform} {state}")
+        connectivity = "; ".join(connectivity_parts) if connectivity_parts else "none"
 
         # Count pending /queue follow-ups (slot + overflow).
         adapter = self.adapters.get(source.platform) if source else None
@@ -5439,27 +5506,522 @@ class GatewayRunner:
             except Exception:
                 title = None
 
-        lines = [
-            "📊 **Hermes Gateway Status**",
-            "",
-            f"**Session ID:** `{session_entry.session_id}`",
-        ]
-        if title:
-            lines.append(f"**Title:** {title}")
-        lines.extend([
-            f"**Created:** {session_entry.created_at.strftime('%Y-%m-%d %H:%M')}",
-            f"**Last Activity:** {session_entry.updated_at.strftime('%Y-%m-%d %H:%M')}",
-            f"**Tokens:** {session_entry.total_tokens:,}",
-            f"**Agent Running:** {'Yes ⚡' if is_running else 'No'}",
-        ])
-        if queue_depth:
-            lines.append(f"**Queued follow-ups:** {queue_depth}")
-        lines.extend([
-            "",
-            f"**Connected Platforms:** {', '.join(connected_platforms)}",
-        ])
+        is_running = session_key in self._running_agents
+        active_agent = self._running_agents.get(session_key)
+        agent_state = "running" if is_running else "idle"
 
-        return "\n".join(lines)
+        model = "auto"
+        override = (getattr(self, "_session_model_overrides", {}) or {}).get(session_key) or {}
+        override_provider = str(override.get("provider") or "").strip()
+        override_model = str(override.get("model") or "").strip()
+        if override_model:
+            model = f"{override_provider}/{override_model}" if override_provider else override_model
+        elif is_running and active_agent is not None:
+            agent_model = str(getattr(active_agent, "model", "") or "").strip()
+            if agent_model:
+                model = agent_model
+        else:
+            env_model = str(os.getenv("HERMES_MODEL") or "").strip()
+            env_provider = str(os.getenv("HERMES_INFERENCE_PROVIDER") or "").strip()
+            if env_model:
+                model = f"{env_provider}/{env_model}" if env_provider else env_model
+
+        tools = str(os.getenv("HERMES_ENABLED_TOOLSETS") or "").strip()
+        tools_display = ", ".join(part.strip() for part in tools.split(",") if part.strip()) or "default"
+
+        jobs_display = "0 scheduled"
+        try:
+            from cron.jobs import list_jobs
+
+            jobs = list_jobs(include_disabled=False)
+            jobs_display = f"{len(jobs)} scheduled"
+        except Exception:
+            pass
+
+        processes_display = "0 running"
+        try:
+            from tools.process_registry import process_registry
+
+            running_processes = [
+                proc for proc in process_registry.list_sessions()
+                if proc.get("status") == "running"
+            ]
+            processes_display = f"{len(running_processes)} running"
+        except Exception:
+            pass
+
+        recent_sessions_display = session_entry.session_id
+        try:
+            entries = list((getattr(self.session_store, "_entries", {}) or {}).values())
+            if session_entry not in entries:
+                entries.append(session_entry)
+            entries.sort(key=lambda item: item.updated_at, reverse=True)
+            recent_session_ids = [entry.session_id for entry in entries[:3] if entry.session_id]
+            if recent_session_ids:
+                recent_sessions_display = ", ".join(recent_session_ids)
+        except Exception:
+            pass
+
+        status = "operational" if connected_platforms else "degraded"
+        if getattr(self, "_draining", False):
+            status = "draining"
+
+        fields = {
+            "Profile": self._active_profile_name(),
+            "Model": model,
+            "Tools": tools_display,
+            "Jobs": jobs_display,
+            "Processes": processes_display,
+            "Recent sessions": recent_sessions_display,
+            "Connectivity": connectivity,
+            "Session": session_entry.session_id,
+            "Created": session_entry.created_at.strftime("%Y-%m-%d %H:%M"),
+            "Last activity": session_entry.updated_at.strftime("%Y-%m-%d %H:%M"),
+            "Tokens": f"{session_entry.total_tokens:,}",
+            "Agent": agent_state,
+        }
+        if title:
+            fields["Title"] = title
+
+        return render_status_card(
+            StatusCard(
+                title="Hermes Telegram Cockpit",
+                status=status,
+                summary="Gateway status dashboard.",
+                fields=fields,
+                next_actions=(
+                    NextAction(NextActionKind.CONTINUE, "Atualizar status"),
+                    NextAction(NextActionKind.DETAIL, "Abrir detalhes de agentes, jobs e processos"),
+                    NextAction(NextActionKind.EXECUTE, "Executar próxima ação operacional"),
+                ),
+            )
+        )
+
+    async def _handle_jobs_command(self, event: MessageEvent) -> str:
+        """Handle /jobs — show and operate scheduled cron jobs."""
+        args = event.get_command_args().strip().split()
+        action = args[0].lower() if args else "list"
+        job_id = args[1].strip() if len(args) > 1 else ""
+
+        if action in {"list", "ls", ""}:
+            from cron.jobs import list_jobs
+            from gateway.cockpit.jobs import build_jobs_dashboard_keyboard_spec, render_jobs_dashboard, summarize_jobs
+
+            jobs = summarize_jobs(list_jobs(include_disabled=True))
+            dashboard = render_jobs_dashboard(jobs)
+            action_store = self._cockpit_action_store_for(event)
+            if action_store:
+                keyboard = build_jobs_dashboard_keyboard_spec(
+                    jobs,
+                    store=action_store,
+                    chat_id=str(event.source.chat_id or ""),
+                    user_id=str(event.source.user_id or event.source.user_name or event.source.chat_id or ""),
+                )
+                if await self._send_cockpit_response(event, dashboard, keyboard):
+                    return None
+            return dashboard
+
+        if action == "docs":
+            return (
+                "Cron jobs docs: https://hermes-agent.nousresearch.com/docs/user-guide/features/cron\n\n"
+                "Useful commands:\n"
+                "- /jobs — dashboard\n"
+                "- /jobs run <job_id>\n"
+                "- /jobs pause <job_id>\n"
+                "- /jobs resume <job_id>"
+            )
+
+        if action == "create":
+            return (
+                "To create a cronjob, tell me the schedule and the task. Examples:\n\n"
+                "- Create a cronjob every day at 9am to summarize AI coding news.\n"
+                "- Create a cronjob every 2h to check Railway deploy status.\n\n"
+                "I will use the cronjob tool after you provide the schedule and prompt."
+            )
+
+        if action not in {"run", "pause", "resume", "edit"}:
+            return "Usage: /jobs [create|docs] or /jobs [run|pause|resume|edit] <job_id>"
+
+        if not job_id:
+            return f"Usage: /jobs {action} <job_id>"
+
+        if action == "run":
+            from cron.jobs import trigger_job
+
+            if not trigger_job(job_id):
+                return f"Job `{job_id}` was not found. Run /jobs to see available job IDs."
+            return f"Scheduled job `{job_id}` to run on the next scheduler tick."
+
+        if action == "pause":
+            from cron.jobs import pause_job
+
+            if not pause_job(job_id, reason="manual from /jobs"):
+                return f"Job `{job_id}` was not found. Run /jobs to see available job IDs."
+            return f"Paused job `{job_id}`."
+
+        if action == "resume":
+            from cron.jobs import resume_job
+
+            if not resume_job(job_id):
+                return f"Job `{job_id}` was not found. Run /jobs to see available job IDs."
+            return f"Resumed job `{job_id}`."
+
+        return (
+            f"Edit job `{job_id}` with the cronjob tool: "
+            f"cronjob(action='update', job_id='{job_id}', ...)."
+        )
+
+    async def _handle_projects_command(self, event: MessageEvent) -> str:
+        """Handle /projects — show recurring projects and action intents."""
+        from gateway.cockpit.projects import (
+            build_projects_dashboard_keyboard_spec,
+            find_project,
+            load_project_registry,
+            render_projects_dashboard,
+        )
+
+        args = event.get_command_args().strip().split()
+        action = args[0].lower() if args else "list"
+        project_query = args[1].strip() if len(args) > 1 else ""
+        projects = load_project_registry()
+
+        if action in {"list", "ls", ""}:
+            dashboard = render_projects_dashboard(projects)
+            action_store = self._cockpit_action_store_for(event)
+            if action_store and projects:
+                keyboard = build_projects_dashboard_keyboard_spec(
+                    projects,
+                    store=action_store,
+                    chat_id=str(event.source.chat_id or ""),
+                    user_id=str(event.source.user_id or event.source.user_name or event.source.chat_id or ""),
+                )
+                if await self._send_cockpit_response(event, dashboard, keyboard):
+                    return None
+            return dashboard
+
+        if action not in {"continue", "inspect", "review", "diagram", "handoff"}:
+            return "Usage: /projects [continue|inspect|review|diagram|handoff] <project>"
+
+        if not project_query:
+            return f"Usage: /projects {action} <project>"
+
+        project = find_project(projects, project_query)
+        if not project:
+            return f"Project `{project_query}` was not found. Run /projects to see registered projects."
+
+        if action == "continue":
+            if project.last_session:
+                return f"Resume project `{project.name}` from session `{project.last_session}`."
+            return f"Continue project `{project.name}` at `{project.path or 'no path configured'}`."
+
+        if action == "inspect":
+            lines = [f"## Project: {project.name}", f"Status: {project.status}"]
+            if project.path:
+                lines.append(f"Path: {project.path}")
+            if project.aliases:
+                lines.append(f"Aliases: {', '.join(project.aliases)}")
+            if project.context:
+                lines.append(f"Context: {project.context}")
+            if project.skills:
+                lines.append(f"Skills: {', '.join(project.skills)}")
+            if project.commands:
+                lines.append(f"Commands: {', '.join(project.commands.keys())}")
+            if project.last_session:
+                lines.append(f"Last session: {project.last_session}")
+            return "\n".join(lines)
+
+        if action == "review":
+            return f"Code review intent for `{project.name}`. Path: `{project.path or 'not configured'}`."
+
+        if action == "diagram":
+            return f"Diagram intent for `{project.name}`. Path: `{project.path or 'not configured'}`."
+
+        return f"Handoff intent for `{project.name}`."
+
+    def _cockpit_action_store_for(self, event: MessageEvent):
+        """Return the platform adapter's cockpit action store, if available."""
+        if event.source.platform != Platform.TELEGRAM:
+            return None
+        adapter = self.adapters.get(event.source.platform)
+        store = getattr(adapter, "_cockpit_action_store", None) if adapter else None
+        try:
+            from gateway.cockpit.actions import CockpitActionStore
+
+            return store if isinstance(store, CockpitActionStore) else None
+        except Exception:
+            return None
+
+    async def _send_cockpit_response(
+        self,
+        event: MessageEvent,
+        content: str,
+        keyboard,
+    ) -> bool:
+        """Send a Telegram Cockpit response with inline keyboard when possible."""
+        if event.source.platform != Platform.TELEGRAM:
+            return False
+        adapter = self.adapters.get(event.source.platform)
+        if not adapter or not getattr(keyboard, "rows", None):
+            return False
+        metadata = {"cockpit_keyboard": keyboard}
+        if event.source.thread_id:
+            metadata["thread_id"] = event.source.thread_id
+        await adapter.send(
+            event.source.chat_id,
+            content,
+            reply_to=event.message_id,
+            metadata=metadata,
+        )
+        return True
+
+    def _newtask_store(self):
+        """Return the runner's /newtask state store, creating it for test shims."""
+        store = getattr(self, "_newtask_state_store", None)
+        if store is None:
+            from gateway.cockpit.state import InteractionStateStore
+
+            store = InteractionStateStore()
+            self._newtask_state_store = store
+        return store
+
+    async def _handle_newtask_command(self, event: MessageEvent) -> str:
+        """Handle /newtask — guided task creation flow."""
+        from gateway.cockpit.newtask import (
+            NEWTASK_STEPS,
+            build_newtask_keyboard_spec,
+            build_newtask_prompt,
+            render_newtask_wizard,
+            start_newtask_flow,
+        )
+
+        chat_id = str(event.source.chat_id or "")
+        user_id = str(event.source.user_id or event.source.user_name or chat_id)
+        store = self._newtask_store()
+        args = event.get_command_args().strip().split()
+        action = args[0].lower() if args else "start"
+        value = args[1].lower() if len(args) > 1 else ""
+
+        if action in {"start", "list", "new", ""}:
+            state = start_newtask_flow(store, chat_id=chat_id, user_id=user_id)
+            rendered = render_newtask_wizard(state)
+            action_store = self._cockpit_action_store_for(event)
+            if action_store:
+                keyboard = build_newtask_keyboard_spec(state, store=action_store, chat_id=chat_id, user_id=user_id)
+                if await self._send_cockpit_response(event, rendered, keyboard):
+                    return None
+            return rendered
+
+        state = store.latest(flow="newtask", chat_id=chat_id, user_id=user_id)
+        if not state:
+            state = start_newtask_flow(store, chat_id=chat_id, user_id=user_id)
+
+        if action == "confirm":
+            if state.step != "confirm":
+                return render_newtask_wizard(state)
+            completed = store.complete(state.flow_id, chat_id=chat_id, user_id=user_id)
+            if not completed:
+                return "The /newtask flow expired. Run /newtask to start again."
+            return "Confirmed new task.\n\n" + build_newtask_prompt(completed.answers)
+
+        step = NEWTASK_STEPS.get(action)
+        if not step:
+            return "Usage: /newtask [type|mode|agent|deliverable|confirm] [choice]"
+        if not value:
+            return f"Usage: /newtask {action} <choice>"
+        option = step.option(value)
+        if not option:
+            valid = ", ".join(item.value for item in step.options)
+            return f"Unknown {action} choice `{value}`. Valid choices: {valid}."
+
+        updated = store.answer(
+            state.flow_id,
+            chat_id=chat_id,
+            user_id=user_id,
+            key=step.key,
+            value=option.value,
+            next_step=NEWTASK_STEPS.next_step(step.key),
+        )
+        if not updated:
+            return "The /newtask flow expired. Run /newtask to start again."
+        rendered = render_newtask_wizard(updated)
+        action_store = self._cockpit_action_store_for(event)
+        if action_store:
+            keyboard = build_newtask_keyboard_spec(updated, store=action_store, chat_id=chat_id, user_id=user_id)
+            if await self._send_cockpit_response(event, rendered, keyboard):
+                return None
+        return rendered
+
+    def _research_store(self):
+        """Return the runner's /research state store, creating it for test shims."""
+        store = getattr(self, "_research_state_store", None)
+        if store is None:
+            from gateway.cockpit.state import InteractionStateStore
+
+            store = InteractionStateStore()
+            self._research_state_store = store
+        return store
+
+    async def _handle_research_command(self, event: MessageEvent) -> str:
+        """Handle /research — guided research request flow."""
+        from gateway.cockpit.research import (
+            RESEARCH_STEPS,
+            build_research_keyboard_spec,
+            build_research_prompt,
+            render_research_wizard,
+            start_research_flow,
+        )
+
+        chat_id = str(event.source.chat_id or "")
+        user_id = str(event.source.user_id or event.source.user_name or chat_id)
+        store = self._research_store()
+        raw_args = event.get_command_args().strip()
+        args = raw_args.split()
+        action = args[0].lower() if args else "start"
+        value = " ".join(args[1:]).strip() if len(args) > 1 else ""
+
+        if action in {"start", "list", "new", ""}:
+            state = start_research_flow(store, chat_id=chat_id, user_id=user_id)
+            rendered = render_research_wizard(state)
+            action_store = self._cockpit_action_store_for(event)
+            if action_store:
+                keyboard = build_research_keyboard_spec(state, store=action_store, chat_id=chat_id, user_id=user_id)
+                if await self._send_cockpit_response(event, rendered, keyboard):
+                    return None
+            return rendered
+
+        state = store.latest(flow="research", chat_id=chat_id, user_id=user_id)
+        if not state:
+            state = start_research_flow(store, chat_id=chat_id, user_id=user_id)
+
+        if action == "confirm":
+            if state.step != "confirm":
+                return render_research_wizard(state)
+            completed = store.complete(state.flow_id, chat_id=chat_id, user_id=user_id)
+            if not completed:
+                return "The /research flow expired. Run /research to start again."
+            return "Confirmed research request.\n\n" + build_research_prompt(completed.answers)
+
+        step = RESEARCH_STEPS.get(action)
+        if not step:
+            return "Usage: /research [depth|output|artifact|topic|confirm] [choice]"
+        if not value:
+            return f"Usage: /research {action} <choice>"
+
+        selected_value = value
+        if step.options:
+            option = step.option(value)
+            if not option:
+                valid = ", ".join(item.value for item in step.options)
+                return f"Unknown {action} choice `{value}`. Valid choices: {valid}."
+            selected_value = option.value
+
+        updated = store.answer(
+            state.flow_id,
+            chat_id=chat_id,
+            user_id=user_id,
+            key=step.key,
+            value=selected_value,
+            next_step=RESEARCH_STEPS.next_step(step.key),
+        )
+        if not updated:
+            return "The /research flow expired. Run /research to start again."
+        rendered = render_research_wizard(updated)
+        action_store = self._cockpit_action_store_for(event)
+        if action_store:
+            keyboard = build_research_keyboard_spec(updated, store=action_store, chat_id=chat_id, user_id=user_id)
+            if await self._send_cockpit_response(event, rendered, keyboard):
+                return None
+        return rendered
+
+    def _review_store(self):
+        """Return the runner's /review state store, creating it for test shims."""
+        store = getattr(self, "_review_state_store", None)
+        if store is None:
+            from gateway.cockpit.state import InteractionStateStore
+
+            store = InteractionStateStore()
+            self._review_state_store = store
+        return store
+
+    async def _handle_review_command(self, event: MessageEvent) -> str:
+        """Handle /review — guided code review request flow."""
+        from gateway.cockpit.review import (
+            REVIEW_STEPS,
+            build_review_keyboard_spec,
+            build_review_prompt,
+            render_review_wizard,
+            start_review_flow,
+        )
+
+        chat_id = str(event.source.chat_id or "")
+        user_id = str(event.source.user_id or event.source.user_name or chat_id)
+        store = self._review_store()
+        args = event.get_command_args().strip().split()
+        action = args[0].lower() if args else "start"
+        value = " ".join(args[1:]).strip() if len(args) > 1 else ""
+
+        if action in {"start", "list", "new", ""}:
+            state = start_review_flow(store, chat_id=chat_id, user_id=user_id)
+            rendered = render_review_wizard(state)
+            action_store = self._cockpit_action_store_for(event)
+            if action_store:
+                keyboard = build_review_keyboard_spec(state, store=action_store, chat_id=chat_id, user_id=user_id)
+                if await self._send_cockpit_response(event, rendered, keyboard):
+                    return None
+            return rendered
+
+        state = store.latest(flow="review", chat_id=chat_id, user_id=user_id)
+        if not state:
+            state = start_review_flow(store, chat_id=chat_id, user_id=user_id)
+
+        if action == "confirm":
+            if state.step != "confirm":
+                return render_review_wizard(state)
+            completed = store.complete(state.flow_id, chat_id=chat_id, user_id=user_id)
+            if not completed:
+                return "The /review flow expired. Run /review to start again."
+            return "Confirmed review request.\n\n" + build_review_prompt(completed.answers)
+
+        step = REVIEW_STEPS.get(action)
+        if not step:
+            return "Usage: /review [scope|checks|runner|output|target|confirm] [choice]"
+        if not value:
+            return f"Usage: /review {action} <choice>"
+
+        selected_value = value
+        if step.options:
+            option = step.option(value)
+            if not option:
+                valid = ", ".join(item.value for item in step.options)
+                return f"Unknown {action} choice `{value}`. Valid choices: {valid}."
+            selected_value = option.value
+
+        updated = store.answer(
+            state.flow_id,
+            chat_id=chat_id,
+            user_id=user_id,
+            key=step.key,
+            value=selected_value,
+            next_step=REVIEW_STEPS.next_step(step.key),
+        )
+        if not updated:
+            return "The /review flow expired. Run /review to start again."
+        rendered = render_review_wizard(updated)
+        action_store = self._cockpit_action_store_for(event)
+        if action_store:
+            keyboard = build_review_keyboard_spec(updated, store=action_store, chat_id=chat_id, user_id=user_id)
+            if await self._send_cockpit_response(event, rendered, keyboard):
+                return None
+        return rendered
+
+    def _active_profile_name(self) -> str:
+        """Return the active Hermes profile name for user-facing status output."""
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            return get_active_profile_name()
+        except Exception:
+            return "unknown"
 
     async def _handle_agents_command(self, event: MessageEvent) -> str:
         """Handle /agents command - list active agents and running tasks."""

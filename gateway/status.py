@@ -104,13 +104,38 @@ def _get_scope_lock_path(scope: str, identity: str) -> Path:
 
 
 def _get_process_start_time(pid: int) -> Optional[int]:
-    """Return the kernel start time for a process when available."""
+    """Return a stable process start-time token when available.
+
+    Linux uses ``/proc/<pid>/stat`` field 22 (clock ticks since boot).
+    macOS falls back to ``ps -o lstart=`` and converts the wall-clock start
+    time to an epoch timestamp so PID-file and lock-file comparisons can still
+    distinguish stale PID reuse.
+    """
     stat_path = Path(f"/proc/{pid}/stat")
     try:
         # Field 22 in /proc/<pid>/stat is process start time (clock ticks).
         return int(stat_path.read_text().split()[21])
     except (FileNotFoundError, IndexError, PermissionError, ValueError, OSError):
-        return None
+        pass
+
+    if sys.platform == "darwin":
+        try:
+            result = subprocess.run(
+                ["ps", "-o", "lstart=", "-p", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            if result.returncode == 0:
+                raw = (result.stdout or "").strip()
+                if raw:
+                    started = datetime.strptime(raw, "%a %b %d %H:%M:%S %Y")
+                    return int(started.timestamp())
+        except (subprocess.SubprocessError, ValueError, OSError):
+            pass
+
+    return None
 
 
 def get_process_start_time(pid: int) -> Optional[int]:
@@ -369,15 +394,56 @@ def write_pid_file() -> None:
 
     Uses atomic O_CREAT | O_EXCL creation so that concurrent --replace
     invocations race: exactly one process wins and the rest get
-    FileExistsError.
+    FileExistsError. If the existing file points at a stale/dead process,
+    clean it up once and retry the atomic create.
     """
     path = _get_pid_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    record = json.dumps(_build_pid_record())
-    try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        raise  # Let caller decide: another gateway is racing us
+    current_record = _build_pid_record()
+    record = json.dumps(current_record)
+
+    fd = None
+    for attempt in range(2):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            if attempt > 0:
+                raise  # Let caller decide: another live gateway is racing us
+
+            existing = _read_pid_record(path)
+            if not existing:
+                _cleanup_invalid_pid_path(path, cleanup_stale=True)
+                continue
+
+            try:
+                existing_pid = int(existing["pid"])
+            except (KeyError, TypeError, ValueError):
+                _cleanup_invalid_pid_path(path, cleanup_stale=True)
+                continue
+
+            stale = False
+            try:
+                os.kill(existing_pid, 0)
+            except ProcessLookupError:
+                stale = True
+            except PermissionError:
+                stale = False
+            else:
+                existing_start = existing.get("start_time")
+                current_start = _get_process_start_time(existing_pid)
+                if existing_start is not None and current_start is not None and current_start != existing_start:
+                    stale = True
+
+            if not stale:
+                raise
+
+            _cleanup_invalid_pid_path(path, cleanup_stale=True)
+            continue
+
+    if fd is None:
+        raise FileExistsError(path)
+
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(record)
