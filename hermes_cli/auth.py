@@ -460,7 +460,7 @@ def _resolve_kimi_base_url(api_key: str, default_url: str, env_override: str) ->
     """Return the correct Kimi base URL based on the API key prefix.
 
     If the user has explicitly set KIMI_BASE_URL, that always wins.
-    Otherwise, sk-kimi- prefixed keys route to api.kimi.com/coding/v1.
+    Otherwise, sk-kimi- prefixed keys route to api.kimi.com/coding.
     """
     if env_override:
         return env_override

@@ -3953,7 +3953,7 @@ def _model_flow_copilot_acp(config, current_model=""):
 def _model_flow_kimi(config, current_model=""):
     """Kimi / Moonshot model selection with automatic endpoint routing.
 
-    - sk-kimi-* keys   → api.kimi.com/coding/v1  (Kimi Coding Plan)
+    - sk-kimi-* keys   → api.kimi.com/coding     (Kimi Coding Plan)
     - Other keys        → api.moonshot.ai/v1      (legacy Moonshot)
 
     No manual base URL prompt — endpoint is determined by key prefix.
@@ -4020,14 +4020,9 @@ def _model_flow_kimi(config, current_model=""):
 
     # Step 3: Model selection — show appropriate models for the endpoint
     if is_coding_plan:
-        # Coding Plan models (kimi-k2.6 first)
-        model_list = [
-            "kimi-k2.6",
-            "kimi-k2.5",
-            "kimi-for-coding",
-            "kimi-k2-thinking",
-            "kimi-k2-thinking-turbo",
-        ]
+        # Kimi Code docs require the stable model id `kimi-for-coding`.
+        # The backend automatically maps it to the latest coding model.
+        model_list = ["kimi-for-coding"]
     else:
         # Legacy Moonshot models (excludes Coding Plan-only models)
         model_list = _PROVIDER_MODELS.get("moonshot", [])

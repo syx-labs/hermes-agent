@@ -19,6 +19,9 @@ export function parseAllowedUsers(rawValue) {
 }
 
 function readMappingFile(sessionDir, identifier, suffix = '') {
+  if (!sessionDir || typeof sessionDir !== 'string') {
+    return null;
+  }
   const filePath = path.join(sessionDir, `lid-mapping-${identifier}${suffix}.json`);
   if (!existsSync(filePath)) {
     return null;

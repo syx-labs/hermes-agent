@@ -129,11 +129,26 @@ def _read_process_cmdline(pid: int) -> Optional[str]:
     try:
         raw = cmdline_path.read_bytes()
     except (FileNotFoundError, PermissionError, OSError):
-        return None
+        raw = b""
 
-    if not raw:
+    if raw:
+        return raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore").strip()
+
+    # macOS has no /proc, so fall back to ps. This is important for stale
+    # gateway token locks: without a live cmdline check, a recycled PID can
+    # make an old lock look active forever.
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
         return None
-    return raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore").strip()
+    cmdline = (result.stdout or "").strip()
+    return cmdline or None
 
 
 def _looks_like_gateway_process(pid: int) -> bool:
@@ -515,6 +530,12 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
                     and current_start is not None
                     and current_start != existing.get("start_time")
                 ):
+                    stale = True
+                # Check whether the live PID is still the gateway process that
+                # wrote the lock. On macOS start_time is unavailable because
+                # there is no /proc, so PID reuse can otherwise leave a stale
+                # token lock pinned to an unrelated process.
+                if not stale and _record_looks_like_gateway(existing) and not _looks_like_gateway_process(existing_pid):
                     stale = True
                 # Check if process is stopped (Ctrl+Z / SIGTSTP) — stopped
                 # processes still respond to os.kill(pid, 0) but are not
