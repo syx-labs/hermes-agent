@@ -142,6 +142,7 @@ AUTHOR_MAP = {
     "egitimviscara@gmail.com": "uzunkuyruk",
     "zhekinmaksim@gmail.com": "Zhekinmaksim",
     "obafemiferanmi1999@gmail.com": "KvnGz",
+    "shadowlynx.labs@gmail.com": "syx-labs",
     "159539633+MottledShadow@users.noreply.github.com": "MottledShadow",
     "aludwin+gh@gmail.com": "adamludwin",
     "ngusev@astralinux.ru": "NikolayGusev-astra",

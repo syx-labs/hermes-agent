@@ -11,6 +11,7 @@ hot-reloaded by the webhook adapter without a gateway restart.
 """
 
 import json
+import os
 import re
 import secrets
 import time
@@ -66,14 +67,24 @@ def _get_webhook_config() -> dict:
         return {}
 
 
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("true", "1", "yes")
+
+
 def _is_webhook_enabled() -> bool:
-    return bool(_get_webhook_config().get("enabled"))
+    if bool(_get_webhook_config().get("enabled")):
+        return True
+    return _env_flag("WEBHOOK_ENABLED")
 
 
 def _get_webhook_base_url() -> str:
     wh = _get_webhook_config().get("extra", {})
-    host = wh.get("host", "0.0.0.0")
-    port = wh.get("port", 8644)
+    host = wh.get("host") or os.environ.get("WEBHOOK_HOST") or "0.0.0.0"
+    raw_port = wh.get("port") or os.environ.get("WEBHOOK_PORT") or 8644
+    try:
+        port = int(raw_port)
+    except (TypeError, ValueError):
+        port = 8644
     display_host = "localhost" if host == "0.0.0.0" else host
     return f"http://{display_host}:{port}"
 
