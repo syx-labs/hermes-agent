@@ -48,6 +48,7 @@ AUTHOR_MAP = {
     "teknium@nousresearch.com": "teknium1",
     "cleo@edaphic.xyz": "curiouscleo",
     "127238744+teknium1@users.noreply.github.com": "teknium1",
+    "shadowlynx.labs@gmail.com": "syx-labs",
     "159539633+MottledShadow@users.noreply.github.com": "MottledShadow",
     "aludwin+gh@gmail.com": "adamludwin",
     "ngusev@astralinux.ru": "NikolayGusev-astra",
