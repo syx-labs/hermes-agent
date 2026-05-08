@@ -6,6 +6,7 @@ import pytest
 from argparse import Namespace
 from pathlib import Path
 
+import hermes_cli.webhook as _wh_mod
 from hermes_cli.webhook import (
     webhook_command,
     _load_subscriptions,
@@ -14,10 +15,22 @@ from hermes_cli.webhook import (
     _is_webhook_enabled,
 )
 
+# Capture real implementations before any autouse fixture patches them, so
+# tests targeting env-var fallback can call the genuine logic.
+_REAL_IS_WEBHOOK_ENABLED = _wh_mod._is_webhook_enabled
+_REAL_GET_WEBHOOK_BASE_URL = _wh_mod._get_webhook_base_url
+
+
+_WEBHOOK_ENV_VARS = ("WEBHOOK_ENABLED", "WEBHOOK_HOST", "WEBHOOK_PORT")
+
 
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # Strip ambient webhook env vars so tests are deterministic regardless
+    # of the developer's shell or CI environment.
+    for var in _WEBHOOK_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
     # Default: webhooks enabled (most tests need this)
     monkeypatch.setattr(
         "hermes_cli.webhook._is_webhook_enabled", lambda: True
@@ -187,3 +200,107 @@ class TestWebhookEnabledGate:
         )
         import hermes_cli.webhook as wh_mod
         assert wh_mod._is_webhook_enabled() is True
+
+
+class TestEnvVarFallback:
+    """Webhook can be enabled and configured purely via environment variables,
+    without any platforms.webhook block in config.yaml."""
+
+    @pytest.fixture(autouse=True)
+    def _restore_real(self, monkeypatch):
+        # Undo the autouse stub so we exercise the real implementations.
+        monkeypatch.setattr(
+            "hermes_cli.webhook._is_webhook_enabled",
+            _REAL_IS_WEBHOOK_ENABLED,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.webhook._get_webhook_base_url",
+            _REAL_GET_WEBHOOK_BASE_URL,
+        )
+        # Pretend config.yaml has no webhook block — env is the only source.
+        monkeypatch.setattr(
+            "hermes_cli.webhook._get_webhook_config",
+            lambda: {},
+        )
+
+    def test_enabled_via_env_var(self, monkeypatch):
+        monkeypatch.setenv("WEBHOOK_ENABLED", "true")
+        assert _wh_mod._is_webhook_enabled() is True
+
+    def test_disabled_when_env_unset(self):
+        # Autouse fixture already cleared the env vars.
+        assert _wh_mod._is_webhook_enabled() is False
+
+    @pytest.mark.parametrize("value", ["true", "True", "TRUE", "1", "yes", " true "])
+    def test_accepts_truthy_values(self, monkeypatch, value):
+        monkeypatch.setenv("WEBHOOK_ENABLED", value)
+        assert _wh_mod._is_webhook_enabled() is True
+
+    @pytest.mark.parametrize("value", ["false", "0", "no", "", "off"])
+    def test_rejects_falsy_values(self, monkeypatch, value):
+        monkeypatch.setenv("WEBHOOK_ENABLED", value)
+        assert _wh_mod._is_webhook_enabled() is False
+
+    def test_base_url_from_env(self, monkeypatch):
+        monkeypatch.setenv("WEBHOOK_HOST", "192.168.1.50")
+        monkeypatch.setenv("WEBHOOK_PORT", "9000")
+        assert _wh_mod._get_webhook_base_url() == "http://192.168.1.50:9000"
+
+    def test_base_url_defaults_when_env_unset(self):
+        # No config, no env → defaults to 0.0.0.0:8644 (displayed as localhost).
+        assert _wh_mod._get_webhook_base_url() == "http://localhost:8644"
+
+    def test_base_url_invalid_port_falls_back(self, monkeypatch):
+        monkeypatch.setenv("WEBHOOK_PORT", "not-a-number")
+        assert _wh_mod._get_webhook_base_url() == "http://localhost:8644"
+
+    def test_base_url_partial_env(self, monkeypatch):
+        # Only host overridden → port keeps default.
+        monkeypatch.setenv("WEBHOOK_HOST", "0.0.0.0")
+        assert _wh_mod._get_webhook_base_url() == "http://localhost:8644"
+
+    def test_list_works_when_enabled_via_env(self, monkeypatch, capsys):
+        monkeypatch.setenv("WEBHOOK_ENABLED", "true")
+        # webhook_command -> _require_webhook_enabled -> real _is_webhook_enabled
+        webhook_command(_make_args(webhook_action="list"))
+        out = capsys.readouterr().out
+        assert "not enabled" not in out.lower()
+        # No subscriptions yet → empty-state message, NOT the setup hint.
+        assert "No dynamic" in out
+
+    def test_list_blocked_when_env_unset(self, capsys):
+        webhook_command(_make_args(webhook_action="list"))
+        out = capsys.readouterr().out
+        assert "not enabled" in out.lower()
+
+
+class TestConfigPrecedence:
+    """When platforms.webhook is set in config.yaml, it should keep working
+    regardless of env vars (back-compat)."""
+
+    @pytest.fixture(autouse=True)
+    def _restore_real(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.webhook._is_webhook_enabled",
+            _REAL_IS_WEBHOOK_ENABLED,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.webhook._get_webhook_base_url",
+            _REAL_GET_WEBHOOK_BASE_URL,
+        )
+
+    def test_config_enables_without_env(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.webhook._get_webhook_config",
+            lambda: {"enabled": True},
+        )
+        assert _wh_mod._is_webhook_enabled() is True
+
+    def test_config_host_port_used_over_env(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.webhook._get_webhook_config",
+            lambda: {"enabled": True, "extra": {"host": "10.0.0.1", "port": 7000}},
+        )
+        monkeypatch.setenv("WEBHOOK_HOST", "should-be-ignored")
+        monkeypatch.setenv("WEBHOOK_PORT", "9999")
+        assert _wh_mod._get_webhook_base_url() == "http://10.0.0.1:7000"
