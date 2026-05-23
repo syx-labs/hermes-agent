@@ -1,0 +1,12 @@
+{
+  "agents": [
+    {
+      "name": "Claude Code",
+      "command": "HOME=/Users/shadow XDG_CONFIG_HOME=/Users/shadow/.config shadow -p <review prompt> --model sonnet --max-turns 30 --allowedTools Read,Bash",
+      "role": "independent read-only reviewer",
+      "scope": "verify two inline findings against current code",
+      "status": "completed",
+      "verified_by_orchestrator": true
+    }
+  ]
+}
