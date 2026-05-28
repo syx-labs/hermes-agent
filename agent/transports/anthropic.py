@@ -94,8 +94,12 @@ class AnthropicTransport(ProviderTransport):
         reasoning_parts = []
         reasoning_details = []
         tool_calls = []
+        ordered_content = []
 
         for block in response.content:
+            ordered_block = _to_plain_data(block)
+            if isinstance(ordered_block, dict):
+                ordered_content.append(ordered_block)
             if block.type == "text":
                 text_parts.append(block.text)
             elif block.type == "thinking":
@@ -130,6 +134,14 @@ class AnthropicTransport(ProviderTransport):
         provider_data = {}
         if reasoning_details:
             provider_data["reasoning_details"] = reasoning_details
+            # Interleaved thinking emits thinking/tool_use alternated within
+            # one turn.  Their signatures are position-sensitive, so preserve
+            # the native emission order for verbatim replay — flattening into
+            # reasoning_details + tool_calls and regrouping by type triggers
+            # HTTP 400 "thinking ... cannot be modified" on the next turn.
+            # See tests/agent/test_anthropic_interleaved_thinking_order.py.
+            if ordered_content:
+                provider_data["anthropic_ordered_content"] = ordered_content
 
         return NormalizedResponse(
             content="\n".join(text_parts) if text_parts else None,

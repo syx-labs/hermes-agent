@@ -939,6 +939,14 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
         if preserved:
             msg["reasoning_details"] = preserved
 
+    # Anthropic interleaved thinking: preserve the native content-block order
+    # (thinking/tool_use alternation) so the next turn replays the signed
+    # thinking sequence verbatim.  Regrouping flattened buckets by type breaks
+    # the position-sensitive signature (HTTP 400 "cannot be modified").
+    anthropic_ordered = getattr(assistant_message, "anthropic_ordered_content", None)
+    if anthropic_ordered:
+        msg["anthropic_ordered_content"] = anthropic_ordered
+
     # Codex Responses API: preserve encrypted reasoning items for
     # multi-turn continuity. These get replayed as input on the next turn.
     codex_items = getattr(assistant_message, "codex_reasoning_items", None)
