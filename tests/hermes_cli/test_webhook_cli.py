@@ -5,7 +5,6 @@ import os
 import pytest
 import stat
 from argparse import Namespace
-from pathlib import Path
 
 import hermes_cli.webhook as _wh_mod
 from hermes_cli.webhook import (
@@ -13,7 +12,6 @@ from hermes_cli.webhook import (
     _load_subscriptions,
     _save_subscriptions,
     _subscriptions_path,
-    _is_webhook_enabled,
 )
 
 # Capture real implementations before any autouse fixture patches them, so
