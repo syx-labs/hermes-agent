@@ -1755,43 +1755,6 @@ def _convert_assistant_message(m: Dict[str, Any]) -> Dict[str, Any]:
     Handles thinking blocks, regular content, tool calls, and
     reasoning_content injection for Kimi/DeepSeek endpoints.
     """
-    # Fast path: native Anthropic turns carry their content blocks in
-    # emission order under ``anthropic_ordered_content``.  With interleaved
-    # thinking, thinking/tool_use alternate, and their signatures are bound to
-    # that order — replaying the flattened reasoning_details + tool_calls
-    # buckets regroups them by type and triggers HTTP 400 "thinking blocks ...
-    # cannot be modified".  Replay the native order verbatim instead.
-    ordered = m.get("anthropic_ordered_content")
-    if isinstance(ordered, list) and ordered:
-        rebuilt: List[Dict[str, Any]] = []
-        for b in ordered:
-            if not isinstance(b, dict):
-                continue
-            bt = b.get("type")
-            if bt == "thinking":
-                blk: Dict[str, Any] = {"type": "thinking", "thinking": b.get("thinking", "")}
-                sig = b.get("signature")
-                if sig:
-                    blk["signature"] = sig
-                rebuilt.append(blk)
-            elif bt == "redacted_thinking":
-                data = b.get("data")
-                if data:
-                    rebuilt.append({"type": "redacted_thinking", "data": data})
-            elif bt == "text":
-                txt = b.get("text")
-                if isinstance(txt, str) and txt:
-                    rebuilt.append({"type": "text", "text": txt})
-            elif bt == "tool_use":
-                rebuilt.append({
-                    "type": "tool_use",
-                    "id": _sanitize_tool_id(b.get("id", "")),
-                    "name": b.get("name", ""),
-                    "input": b.get("input") or {},
-                })
-        if rebuilt:
-            return {"role": "assistant", "content": rebuilt}
-
     content = m.get("content", "")
     # Anthropic interleaved-thinking fast path: when this turn carries a
     # verbatim, order-preserving block list (set by normalize_response only

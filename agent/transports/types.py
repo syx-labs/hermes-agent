@@ -143,20 +143,6 @@ class NormalizedResponse:
         pd = self.provider_data or {}
         return pd.get("codex_message_items")
 
-    @property
-    def anthropic_ordered_content(self):
-        """Native Anthropic content blocks in emission order (interleaved).
-
-        With interleaved thinking, ``thinking`` and ``tool_use`` blocks
-        alternate within one turn.  Flattening into reasoning_details /
-        tool_calls discards that order; replaying it grouped by type breaks
-        the signed thinking sequence (HTTP 400 "cannot be modified").  This
-        carries the verbatim order so ``_convert_assistant_message`` can
-        replay it unchanged.
-        """
-        pd = self.provider_data or {}
-        return pd.get("anthropic_ordered_content")
-
 
 # ---------------------------------------------------------------------------
 # Factory helpers
