@@ -336,6 +336,62 @@ class TestGoalManager:
         assert prompt.strip()  # non-empty
 
 
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Structured goal state
+# ──────────────────────────────────────────────────────────────────────
+
+
+class TestStructuredGoalState:
+    def test_structured_goal_round_evidence_reviewer_complete(self, hermes_home):
+        from pathlib import Path
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="structured-sid-1")
+        mgr.set("ship a durable goal")
+
+        round_state = mgr.start_round("round prompt")
+        assert round_state.number == 1
+        assert Path(round_state.prompt_path).read_text(encoding="utf-8").strip() == "round prompt"
+
+        round_state = mgr.add_evidence("/tmp/artifact.md")
+        assert round_state.evidence_count == 1
+        assert "/tmp/artifact.md" in Path(round_state.evidence_path).read_text(encoding="utf-8")
+
+        round_state = mgr.set_reviewer("pass", "looks good")
+        assert round_state.reviewer_status == "pass"
+        assert "looks good" in Path(round_state.reviewer_path).read_text(encoding="utf-8")
+
+        payload = mgr.record_decision("complete", "done with evidence")
+        assert payload["decision"] == "complete"
+        assert mgr.state.status == "done"
+        assert mgr.state.structured_goal_path
+        assert Path(mgr.report_path()).exists()
+
+        mgr2 = GoalManager(session_id="structured-sid-1")
+        assert mgr2.state is not None
+        assert mgr2.state.structured_goal_path == mgr.state.structured_goal_path
+        assert "Structured goal" in mgr2.structured_status()
+
+    def test_structured_complete_requires_reviewer_and_evidence(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="structured-sid-2")
+        mgr.set("guard completion")
+        mgr.start_round()
+
+        with pytest.raises(RuntimeError, match="reviewer pass"):
+            mgr.record_decision("complete")
+
+        mgr.set_reviewer("pass")
+        with pytest.raises(RuntimeError, match="evidence"):
+            mgr.record_decision("complete")
+
+        payload = mgr.record_decision("complete", "override", force=True)
+        assert payload["forced"] is True
+        assert mgr.state.status == "done"
+
 # ──────────────────────────────────────────────────────────────────────
 # Smoke: CommandDef is wired
 # ──────────────────────────────────────────────────────────────────────

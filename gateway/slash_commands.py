@@ -1777,6 +1777,58 @@ class GatewaySlashCommandsMixin:
         if not args or lower == "status":
             return mgr.status_line()
 
+        if lower == "structured" or lower == "structured status":
+            try:
+                return mgr.structured_status()
+            except RuntimeError as exc:
+                return f"/goal structured: {exc}"
+
+        if lower.startswith("round"):
+            prompt = args.split(None, 1)[1].strip() if len(args.split(None, 1)) > 1 else ""
+            try:
+                round_state = mgr.start_round(prompt)
+                return f"✓ Goal round {round_state.number:03d} created: {round_state.prompt_path}"
+            except RuntimeError as exc:
+                return f"/goal round: {exc}"
+
+        if lower.startswith("evidence"):
+            evidence = args.split(None, 1)[1].strip() if len(args.split(None, 1)) > 1 else ""
+            try:
+                round_state = mgr.add_evidence(evidence)
+                return f"✓ Evidence added to round {round_state.number:03d}: {round_state.evidence_path}"
+            except (RuntimeError, ValueError) as exc:
+                return f"/goal evidence: {exc}"
+
+        if lower.startswith("reviewer"):
+            rest = args.split(None, 1)[1].strip() if len(args.split(None, 1)) > 1 else ""
+            bits = rest.split(None, 1)
+            status = bits[0] if bits else ""
+            note = bits[1] if len(bits) > 1 else ""
+            try:
+                round_state = mgr.set_reviewer(status, note)
+                return f"✓ Reviewer {round_state.reviewer_status} recorded for round {round_state.number:03d}: {round_state.reviewer_path}"
+            except (RuntimeError, ValueError) as exc:
+                return f"/goal reviewer: {exc}"
+
+        if lower.startswith("decision"):
+            rest = args.split(None, 1)[1].strip() if len(args.split(None, 1)) > 1 else ""
+            force = "--force" in rest.split()
+            rest = " ".join(part for part in rest.split() if part != "--force")
+            bits = rest.split(None, 1)
+            decision = bits[0] if bits else ""
+            note = bits[1] if len(bits) > 1 else ""
+            try:
+                payload = mgr.record_decision(decision, note, force=force)
+                return f"✓ Decision recorded for round {payload['round']:03d}: {payload['decision']}"
+            except (RuntimeError, ValueError) as exc:
+                return f"/goal decision: {exc}"
+
+        if lower == "report":
+            try:
+                return f"Goal report: {mgr.report_path()}"
+            except RuntimeError as exc:
+                return f"/goal report: {exc}"
+
         if lower == "pause":
             state = mgr.pause(reason="user-paused")
             if state is None:
