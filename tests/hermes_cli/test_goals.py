@@ -392,6 +392,49 @@ class TestStructuredGoalState:
         assert payload["forced"] is True
         assert mgr.state.status == "done"
 
+    def test_structured_round_load_ignores_unknown_keys(self, hermes_home):
+        from hermes_cli.goals import StructuredGoalState
+
+        state = StructuredGoalState.from_dict(
+            {
+                "goal_id": "gid",
+                "session_id": "sid",
+                "goal": "g",
+                "path": str(hermes_home / "goals" / "gid"),
+                "created_at": 1.0,
+                "rounds": [{"number": 1, "status": "active", "future_key": "ok"}],
+            }
+        )
+
+        assert state.rounds[0].number == 1
+
+    def test_continue_decision_reactivates_blocked_goal(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="structured-sid-3")
+        mgr.set("recover from block")
+        mgr.record_decision("blocked", "waiting")
+        assert mgr.state is not None
+        assert mgr.state.status == "paused"
+
+        mgr.record_decision("continue", "unblocked")
+
+        assert mgr.state is not None
+        assert mgr.state.status == "active"
+        assert mgr.state.paused_reason is None
+        assert mgr.ensure_structured_goal().status == "active"
+
+    def test_structured_status_uses_display_home_path(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="structured-sid-4")
+        mgr.set("display paths")
+
+        status = mgr.structured_status()
+
+        assert str(hermes_home) not in status
+        assert "~/.hermes/goals/" in status
+
 # ──────────────────────────────────────────────────────────────────────
 # Smoke: CommandDef is wired
 # ──────────────────────────────────────────────────────────────────────
@@ -403,6 +446,7 @@ def test_goal_command_in_registry():
     cmd = resolve_command("goal")
     assert cmd is not None
     assert cmd.name == "goal"
+    assert "structured" in cmd.subcommands
 
 
 def test_goal_command_dispatches_in_cli_registry_helpers():

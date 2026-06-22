@@ -34,7 +34,7 @@ import logging
 import re
 import time
 import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -80,11 +80,22 @@ def _safe_goal_id(raw: str) -> str:
 
 
 def _goals_root() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "goals"
+
+
+def display_goal_path(path: str | Path) -> str:
+    """Return a user-facing path with HERMES_HOME rendered consistently."""
+    raw = str(path)
     try:
-        from hermes_constants import get_hermes_home
-        return get_hermes_home() / "goals"
-    except Exception:  # pragma: no cover - defensive fallback for unusual embedders
-        return Path.home() / ".hermes" / "goals"
+        from hermes_constants import display_hermes_home, get_hermes_home
+
+        resolved = Path(raw).expanduser().resolve()
+        home = get_hermes_home().expanduser().resolve()
+        return str(Path(display_hermes_home()) / resolved.relative_to(home))
+    except Exception:
+        return raw
 
 
 CONTINUATION_PROMPT_TEMPLATE = (
@@ -260,10 +271,12 @@ class StructuredGoalState:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "StructuredGoalState":
+        round_fields = {field.name for field in fields(StructuredGoalRound)}
         rounds = []
         for raw in data.get("rounds") or []:
             if isinstance(raw, dict):
-                rounds.append(StructuredGoalRound(**raw))
+                known = {key: value for key, value in raw.items() if key in round_fields}
+                rounds.append(StructuredGoalRound(**known))
         return cls(
             goal_id=str(data.get("goal_id") or ""),
             session_id=str(data.get("session_id") or ""),
@@ -293,7 +306,7 @@ def _structured_state_file(goal_path: Path) -> Path:
 
 def _write_json(path: Path, data: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
     tmp.replace(path)
 
@@ -309,7 +322,7 @@ def load_structured_goal(path_or_id: str) -> Optional[StructuredGoalState]:
         data = json.loads(state_file.read_text(encoding="utf-8"))
         return StructuredGoalState.from_dict(data)
     except Exception as exc:
-        logger.debug("structured goal load failed for %s: %s", state_file, exc)
+        logger.debug("structured goal load failed for %s: %s", display_goal_path(state_file), exc)
         return None
 
 
@@ -352,7 +365,7 @@ def structured_goal_summary(state: StructuredGoalState) -> str:
     cur_txt = f"round {cur.number:03d}" if cur else "no round"
     return (
         f"Structured goal {state.goal_id} ({state.status}, {cur_txt})\n"
-        f"Path: {state.path}\n"
+        f"Path: {display_goal_path(state.path)}\n"
         f"Reviewer required: {state.reviewer_required}\n"
         f"Rounds: {len(state.rounds)}"
     )
@@ -881,6 +894,12 @@ class GoalManager:
             if self._state is not None:
                 self._state.status = "paused"
                 self._state.paused_reason = decision
+                save_goal(self.session_id, self._state)
+        else:
+            structured.status = "active"
+            if self._state is not None:
+                self._state.status = "active"
+                self._state.paused_reason = None
                 save_goal(self.session_id, self._state)
         save_structured_goal(structured)
         report = Path(structured.path) / "report.md"

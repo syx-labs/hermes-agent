@@ -1768,6 +1768,11 @@ class GatewaySlashCommandsMixin:
         continuation hook then takes over from there.
         """
         args = (event.get_command_args() or "").strip()
+        from hermes_cli.goals import display_goal_path
+
+        arg_parts = args.split(None, 1)
+        subcmd = arg_parts[0].lower() if arg_parts else ""
+        rest_arg = arg_parts[1].strip() if len(arg_parts) > 1 else ""
         lower = args.lower()
 
         mgr, session_entry = self._get_goal_manager_for_event(event)
@@ -1783,35 +1788,34 @@ class GatewaySlashCommandsMixin:
             except RuntimeError as exc:
                 return f"/goal structured: {exc}"
 
-        if lower.startswith("round"):
-            prompt = args.split(None, 1)[1].strip() if len(args.split(None, 1)) > 1 else ""
+        if subcmd == "round":
+            prompt = rest_arg
             try:
                 round_state = mgr.start_round(prompt)
-                return f"✓ Goal round {round_state.number:03d} created: {round_state.prompt_path}"
+                return f"✓ Goal round {round_state.number:03d} created: {display_goal_path(round_state.prompt_path)}"
             except RuntimeError as exc:
                 return f"/goal round: {exc}"
 
-        if lower.startswith("evidence"):
-            evidence = args.split(None, 1)[1].strip() if len(args.split(None, 1)) > 1 else ""
+        if subcmd == "evidence":
+            evidence = rest_arg
             try:
                 round_state = mgr.add_evidence(evidence)
-                return f"✓ Evidence added to round {round_state.number:03d}: {round_state.evidence_path}"
+                return f"✓ Evidence added to round {round_state.number:03d}: {display_goal_path(round_state.evidence_path)}"
             except (RuntimeError, ValueError) as exc:
                 return f"/goal evidence: {exc}"
 
-        if lower.startswith("reviewer"):
-            rest = args.split(None, 1)[1].strip() if len(args.split(None, 1)) > 1 else ""
-            bits = rest.split(None, 1)
+        if subcmd == "reviewer":
+            bits = rest_arg.split(None, 1)
             status = bits[0] if bits else ""
             note = bits[1] if len(bits) > 1 else ""
             try:
                 round_state = mgr.set_reviewer(status, note)
-                return f"✓ Reviewer {round_state.reviewer_status} recorded for round {round_state.number:03d}: {round_state.reviewer_path}"
+                return f"✓ Reviewer {round_state.reviewer_status} recorded for round {round_state.number:03d}: {display_goal_path(round_state.reviewer_path)}"
             except (RuntimeError, ValueError) as exc:
                 return f"/goal reviewer: {exc}"
 
-        if lower.startswith("decision"):
-            rest = args.split(None, 1)[1].strip() if len(args.split(None, 1)) > 1 else ""
+        if subcmd == "decision":
+            rest = rest_arg
             force = "--force" in rest.split()
             rest = " ".join(part for part in rest.split() if part != "--force")
             bits = rest.split(None, 1)
@@ -1825,7 +1829,7 @@ class GatewaySlashCommandsMixin:
 
         if lower == "report":
             try:
-                return f"Goal report: {mgr.report_path()}"
+                return f"Goal report: {display_goal_path(mgr.report_path())}"
             except RuntimeError as exc:
                 return f"/goal report: {exc}"
 
