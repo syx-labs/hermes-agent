@@ -336,6 +336,105 @@ class TestGoalManager:
         assert prompt.strip()  # non-empty
 
 
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Structured goal state
+# ──────────────────────────────────────────────────────────────────────
+
+
+class TestStructuredGoalState:
+    def test_structured_goal_round_evidence_reviewer_complete(self, hermes_home):
+        from pathlib import Path
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="structured-sid-1")
+        mgr.set("ship a durable goal")
+
+        round_state = mgr.start_round("round prompt")
+        assert round_state.number == 1
+        assert Path(round_state.prompt_path).read_text(encoding="utf-8").strip() == "round prompt"
+
+        round_state = mgr.add_evidence("/tmp/artifact.md")
+        assert round_state.evidence_count == 1
+        assert "/tmp/artifact.md" in Path(round_state.evidence_path).read_text(encoding="utf-8")
+
+        round_state = mgr.set_reviewer("pass", "looks good")
+        assert round_state.reviewer_status == "pass"
+        assert "looks good" in Path(round_state.reviewer_path).read_text(encoding="utf-8")
+
+        payload = mgr.record_decision("complete", "done with evidence")
+        assert payload["decision"] == "complete"
+        assert mgr.state.status == "done"
+        assert mgr.state.structured_goal_path
+        assert Path(mgr.report_path()).exists()
+
+        mgr2 = GoalManager(session_id="structured-sid-1")
+        assert mgr2.state is not None
+        assert mgr2.state.structured_goal_path == mgr.state.structured_goal_path
+        assert "Structured goal" in mgr2.structured_status()
+
+    def test_structured_complete_requires_reviewer_and_evidence(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="structured-sid-2")
+        mgr.set("guard completion")
+        mgr.start_round()
+
+        with pytest.raises(RuntimeError, match="reviewer pass"):
+            mgr.record_decision("complete")
+
+        mgr.set_reviewer("pass")
+        with pytest.raises(RuntimeError, match="evidence"):
+            mgr.record_decision("complete")
+
+        payload = mgr.record_decision("complete", "override", force=True)
+        assert payload["forced"] is True
+        assert mgr.state.status == "done"
+
+    def test_structured_round_load_ignores_unknown_keys(self, hermes_home):
+        from hermes_cli.goals import StructuredGoalState
+
+        state = StructuredGoalState.from_dict(
+            {
+                "goal_id": "gid",
+                "session_id": "sid",
+                "goal": "g",
+                "path": str(hermes_home / "goals" / "gid"),
+                "created_at": 1.0,
+                "rounds": [{"number": 1, "status": "active", "future_key": "ok"}],
+            }
+        )
+
+        assert state.rounds[0].number == 1
+
+    def test_continue_decision_reactivates_blocked_goal(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="structured-sid-3")
+        mgr.set("recover from block")
+        mgr.record_decision("blocked", "waiting")
+        assert mgr.state is not None
+        assert mgr.state.status == "paused"
+
+        mgr.record_decision("continue", "unblocked")
+
+        assert mgr.state is not None
+        assert mgr.state.status == "active"
+        assert mgr.state.paused_reason is None
+        assert mgr.ensure_structured_goal().status == "active"
+
+    def test_structured_status_uses_display_home_path(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="structured-sid-4")
+        mgr.set("display paths")
+
+        status = mgr.structured_status()
+
+        assert str(hermes_home) not in status
+        assert "~/.hermes/goals/" in status
+
 # ──────────────────────────────────────────────────────────────────────
 # Smoke: CommandDef is wired
 # ──────────────────────────────────────────────────────────────────────
@@ -347,6 +446,7 @@ def test_goal_command_in_registry():
     cmd = resolve_command("goal")
     assert cmd is not None
     assert cmd.name == "goal"
+    assert "structured" in cmd.subcommands
 
 
 def test_goal_command_dispatches_in_cli_registry_helpers():

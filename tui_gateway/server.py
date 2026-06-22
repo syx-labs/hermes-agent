@@ -8939,9 +8939,60 @@ def _(rid, params: dict) -> dict:
             max_turns = 20
         mgr = GoalManager(session_id=sid_key, default_max_turns=max_turns)
 
-        lower = arg.strip().lower()
+        from hermes_cli.goals import display_goal_path
+
+        stripped_arg = arg.strip()
+        arg_parts = stripped_arg.split(None, 1)
+        subcmd = arg_parts[0].lower() if arg_parts else ""
+        rest_arg = arg_parts[1].strip() if len(arg_parts) > 1 else ""
+        lower = stripped_arg.lower()
         if not arg.strip() or lower == "status":
             return _ok(rid, {"type": "exec", "output": mgr.status_line()})
+        if lower == "structured" or lower == "structured status":
+            try:
+                return _ok(rid, {"type": "exec", "output": mgr.structured_status()})
+            except RuntimeError as exc:
+                return _ok(rid, {"type": "exec", "output": f"/goal structured: {exc}"})
+        if subcmd == "round":
+            prompt = rest_arg
+            try:
+                round_state = mgr.start_round(prompt)
+                return _ok(rid, {"type": "exec", "output": f"✓ Goal round {round_state.number:03d} created: {display_goal_path(round_state.prompt_path)}"})
+            except RuntimeError as exc:
+                return _ok(rid, {"type": "exec", "output": f"/goal round: {exc}"})
+        if subcmd == "evidence":
+            evidence = rest_arg
+            try:
+                round_state = mgr.add_evidence(evidence)
+                return _ok(rid, {"type": "exec", "output": f"✓ Evidence added to round {round_state.number:03d}: {display_goal_path(round_state.evidence_path)}"})
+            except (RuntimeError, ValueError) as exc:
+                return _ok(rid, {"type": "exec", "output": f"/goal evidence: {exc}"})
+        if subcmd == "reviewer":
+            bits = rest_arg.split(None, 1)
+            status = bits[0] if bits else ""
+            note = bits[1] if len(bits) > 1 else ""
+            try:
+                round_state = mgr.set_reviewer(status, note)
+                return _ok(rid, {"type": "exec", "output": f"✓ Reviewer {round_state.reviewer_status} recorded for round {round_state.number:03d}: {display_goal_path(round_state.reviewer_path)}"})
+            except (RuntimeError, ValueError) as exc:
+                return _ok(rid, {"type": "exec", "output": f"/goal reviewer: {exc}"})
+        if subcmd == "decision":
+            rest = rest_arg
+            force = "--force" in rest.split()
+            rest = " ".join(part for part in rest.split() if part != "--force")
+            bits = rest.split(None, 1)
+            decision = bits[0] if bits else ""
+            note = bits[1] if len(bits) > 1 else ""
+            try:
+                payload = mgr.record_decision(decision, note, force=force)
+                return _ok(rid, {"type": "exec", "output": f"✓ Decision recorded for round {payload['round']:03d}: {payload['decision']}"})
+            except (RuntimeError, ValueError) as exc:
+                return _ok(rid, {"type": "exec", "output": f"/goal decision: {exc}"})
+        if lower == "report":
+            try:
+                return _ok(rid, {"type": "exec", "output": f"Goal report: {display_goal_path(mgr.report_path())}"})
+            except RuntimeError as exc:
+                return _ok(rid, {"type": "exec", "output": f"/goal report: {exc}"})
         if lower == "pause":
             state = mgr.pause(reason="user-paused")
             out = "No goal set." if state is None else f"⏸ Goal paused: {state.goal}"
