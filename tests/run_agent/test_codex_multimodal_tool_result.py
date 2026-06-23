@@ -18,6 +18,38 @@ from agent.codex_responses_adapter import (
 )
 
 
+def test_reasoning_plus_tool_call_does_not_emit_empty_assistant_message():
+    """Regression for Codex HTTP 400 "Unsupported content type".
+
+    Long tool-only Codex runs can store encrypted reasoning on assistant
+    messages whose visible content is empty and whose useful output is a
+    structured function_call.  The function_call is already a valid following
+    item for the reasoning block; inserting an extra `{role: assistant,
+    content: ""}` before it makes the Codex backend reject the request.
+    """
+    items = _chat_messages_to_responses_input([
+        {"role": "user", "content": "Run the tool."},
+        {
+            "role": "assistant",
+            "content": "",
+            "codex_reasoning_items": [
+                {"type": "reasoning", "encrypted_content": "opaque", "summary": []},
+            ],
+            "tool_calls": [
+                {
+                    "id": "call_abc",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                },
+            ],
+        },
+    ])
+
+    assert {"type": "reasoning", "encrypted_content": "opaque", "summary": []} in items
+    assert any(item.get("type") == "function_call" for item in items)
+    assert {"role": "assistant", "content": ""} not in items
+
+
 def _build_messages_with_multimodal_tool_result():
     return [
         {"role": "user", "content": "What's in /tmp/foo.png?"},
