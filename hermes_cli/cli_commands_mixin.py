@@ -1788,6 +1788,7 @@ class CLICommandsMixin:
     def _handle_goal_command(self, cmd: str) -> None:
         """Dispatch /goal subcommands: set / draft / show / status / pause / resume / clear."""
         from cli import _DIM, _RST, _cprint
+        from hermes_cli.goals import display_goal_path
         parts = (cmd or "").strip().split(None, 1)
         arg = parts[1].strip() if len(parts) > 1 else ""
 
@@ -1796,6 +1797,9 @@ class CLICommandsMixin:
             _cprint(f"  {_DIM}Goals unavailable (no active session).{_RST}")
             return
 
+        arg_parts = arg.split(None, 1)
+        subcmd = arg_parts[0].lower() if arg_parts else ""
+        rest_arg = arg_parts[1].strip() if len(arg_parts) > 1 else ""
         lower = arg.lower()
 
         # Bare /goal or /goal status → show current state
@@ -1820,6 +1824,63 @@ class CLICommandsMixin:
                 _cprint("  Usage: /goal draft <objective in plain language>")
                 return
             self._handle_goal_draft(objective)
+            return
+
+        if lower == "structured" or lower == "structured status":
+            try:
+                _cprint(f"  {mgr.structured_status()}")
+            except RuntimeError as exc:
+                _cprint(f"  /goal structured: {exc}")
+            return
+
+        if subcmd == "round":
+            prompt = rest_arg
+            try:
+                round_state = mgr.start_round(prompt)
+                _cprint(f"  ✓ Goal round {round_state.number:03d} created: {display_goal_path(round_state.prompt_path)}")
+            except RuntimeError as exc:
+                _cprint(f"  /goal round: {exc}")
+            return
+
+        if subcmd == "evidence":
+            evidence = rest_arg
+            try:
+                round_state = mgr.add_evidence(evidence)
+                _cprint(f"  ✓ Evidence added to round {round_state.number:03d}: {display_goal_path(round_state.evidence_path)}")
+            except (RuntimeError, ValueError) as exc:
+                _cprint(f"  /goal evidence: {exc}")
+            return
+
+        if subcmd == "reviewer":
+            bits = rest_arg.split(None, 1)
+            status = bits[0] if bits else ""
+            note = bits[1] if len(bits) > 1 else ""
+            try:
+                round_state = mgr.set_reviewer(status, note)
+                _cprint(f"  ✓ Reviewer {round_state.reviewer_status} recorded for round {round_state.number:03d}: {display_goal_path(round_state.reviewer_path)}")
+            except (RuntimeError, ValueError) as exc:
+                _cprint(f"  /goal reviewer: {exc}")
+            return
+
+        if subcmd == "decision":
+            rest = rest_arg
+            force = "--force" in rest.split()
+            rest = " ".join(part for part in rest.split() if part != "--force")
+            bits = rest.split(None, 1)
+            decision = bits[0] if bits else ""
+            note = bits[1] if len(bits) > 1 else ""
+            try:
+                payload = mgr.record_decision(decision, note, force=force)
+                _cprint(f"  ✓ Decision recorded for round {payload['round']:03d}: {payload['decision']}")
+            except (RuntimeError, ValueError) as exc:
+                _cprint(f"  /goal decision: {exc}")
+            return
+
+        if lower == "report":
+            try:
+                _cprint(f"  Goal report: {display_goal_path(mgr.report_path())}")
+            except RuntimeError as exc:
+                _cprint(f"  /goal report: {exc}")
             return
 
         if lower == "pause":

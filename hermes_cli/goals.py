@@ -33,8 +33,10 @@ import json
 import logging
 import re
 import time
-from dataclasses import dataclass, field, asdict
+import uuid
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -66,6 +68,34 @@ _JUDGE_RESPONSE_SNIPPET_CHARS = 4000
 # exhausted with every reply shaped like `judge returned empty response` or
 # `judge reply was not JSON`.
 DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
+STRUCTURED_GOAL_SCHEMA_VERSION = 1
+STRUCTURED_GOAL_DECISIONS = {"complete", "continue", "blocked", "needs_human"}
+STRUCTURED_GOAL_REVIEWER_STATUSES = {"pass", "fail", "needs_work"}
+
+
+def _safe_goal_id(raw: str) -> str:
+    """Return a filesystem-safe structured-goal id."""
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", (raw or "").strip()).strip(".-")
+    return cleaned[:80] or uuid.uuid4().hex[:12]
+
+
+def _goals_root() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "goals"
+
+
+def display_goal_path(path: str | Path) -> str:
+    """Return a user-facing path with HERMES_HOME rendered consistently."""
+    raw = str(path)
+    try:
+        from hermes_constants import display_hermes_home, get_hermes_home
+
+        resolved = Path(raw).expanduser().resolve()
+        home = get_hermes_home().expanduser().resolve()
+        return str(Path(display_hermes_home()) / resolved.relative_to(home))
+    except Exception:
+        return raw
 
 
 CONTINUATION_PROMPT_TEMPLATE = (
@@ -433,6 +463,10 @@ class GoalState:
     # constraints / boundaries / stop_when). Empty by default; a goal with
     # no contract behaves exactly like the original free-form goal.
     contract: GoalContract = field(default_factory=GoalContract)
+    # Optional pointer to filesystem-backed structured goal state under
+    # ``~/.hermes/goals/<id>``. Old state_meta rows load with these empty.
+    structured_goal_id: Optional[str] = None
+    structured_goal_path: Optional[str] = None
 
     def to_json(self) -> str:
         data = asdict(self)
@@ -464,6 +498,8 @@ class GoalState:
             waiting_reason=data.get("waiting_reason"),
             waiting_since=float(data.get("waiting_since", 0.0) or 0.0),
             contract=GoalContract.from_dict(data.get("contract")),
+            structured_goal_id=data.get("structured_goal_id") or None,
+            structured_goal_path=data.get("structured_goal_path") or None,
         )
 
     # --- contract helpers -------------------------------------------------
@@ -480,6 +516,146 @@ class GoalState:
             return ""
         return "\n".join(f"- {i}. {text}" for i, text in enumerate(self.subgoals, start=1))
 
+
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Structured goal state (filesystem-backed, optional)
+# ──────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class StructuredGoalRound:
+    number: int
+    status: str = "active"
+    created_at: float = 0.0
+    prompt_path: str = ""
+    evidence_path: str = ""
+    reviewer_path: str = ""
+    decision_path: str = ""
+    evidence_count: int = 0
+    reviewer_status: Optional[str] = None
+    decision: Optional[str] = None
+
+
+@dataclass
+class StructuredGoalState:
+    goal_id: str
+    session_id: str
+    goal: str
+    path: str
+    created_at: float
+    current_round: int = 0
+    rounds: List[StructuredGoalRound] = field(default_factory=list)
+    reviewer_required: bool = True
+    status: str = "active"
+    schema_version: int = STRUCTURED_GOAL_SCHEMA_VERSION
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = asdict(self)
+        data["rounds"] = [asdict(r) for r in self.rounds]
+        return data
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "StructuredGoalState":
+        round_fields = {field.name for field in fields(StructuredGoalRound)}
+        rounds = []
+        for raw in data.get("rounds") or []:
+            if isinstance(raw, dict):
+                known = {key: value for key, value in raw.items() if key in round_fields}
+                rounds.append(StructuredGoalRound(**known))
+        return cls(
+            goal_id=str(data.get("goal_id") or ""),
+            session_id=str(data.get("session_id") or ""),
+            goal=str(data.get("goal") or ""),
+            path=str(data.get("path") or ""),
+            created_at=float(data.get("created_at") or 0.0),
+            current_round=int(data.get("current_round") or 0),
+            rounds=rounds,
+            reviewer_required=bool(data.get("reviewer_required", True)),
+            status=str(data.get("status") or "active"),
+            schema_version=int(data.get("schema_version") or STRUCTURED_GOAL_SCHEMA_VERSION),
+        )
+
+    @property
+    def current(self) -> Optional[StructuredGoalRound]:
+        if not self.current_round:
+            return None
+        for round_state in self.rounds:
+            if round_state.number == self.current_round:
+                return round_state
+        return None
+
+
+def _structured_state_file(goal_path: Path) -> Path:
+    return goal_path / "state.json"
+
+
+def _write_json(path: Path, data: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def load_structured_goal(path_or_id: str) -> Optional[StructuredGoalState]:
+    if not path_or_id:
+        return None
+    goal_path = Path(path_or_id).expanduser()
+    if not goal_path.is_absolute():
+        goal_path = _goals_root() / path_or_id
+    state_file = _structured_state_file(goal_path)
+    try:
+        data = json.loads(state_file.read_text(encoding="utf-8"))
+        return StructuredGoalState.from_dict(data)
+    except Exception as exc:
+        logger.debug("structured goal load failed for %s: %s", display_goal_path(state_file), exc)
+        return None
+
+
+def save_structured_goal(state: StructuredGoalState) -> None:
+    _write_json(_structured_state_file(Path(state.path)), state.to_dict())
+
+
+def create_structured_goal(session_id: str, goal: str, *, reviewer_required: bool = True) -> StructuredGoalState:
+    base = _safe_goal_id(session_id) or uuid.uuid4().hex[:12]
+    goal_id = base
+    goal_path = _goals_root() / goal_id
+    if goal_path.exists():
+        goal_id = f"{base}-{uuid.uuid4().hex[:8]}"
+        goal_path = _goals_root() / goal_id
+    goal_path.mkdir(parents=True, exist_ok=True)
+    state = StructuredGoalState(
+        goal_id=goal_id,
+        session_id=session_id,
+        goal=goal,
+        path=str(goal_path),
+        created_at=time.time(),
+        reviewer_required=reviewer_required,
+    )
+    (goal_path / "rounds").mkdir(exist_ok=True)
+    (goal_path / "report.md").write_text(
+        f"# Goal report: {goal}\n\nStatus: active\n\n", encoding="utf-8"
+    )
+    save_structured_goal(state)
+    return state
+
+
+def _append_markdown(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(text.rstrip() + "\n")
+
+
+def structured_goal_summary(state: StructuredGoalState) -> str:
+    cur = state.current
+    cur_txt = f"round {cur.number:03d}" if cur else "no round"
+    return (
+        f"Structured goal {state.goal_id} ({state.status}, {cur_txt})\n"
+        f"Path: {display_goal_path(state.path)}\n"
+        f"Reviewer required: {state.reviewer_required}\n"
+        f"Rounds: {len(state.rounds)}"
+    )
 
 # ──────────────────────────────────────────────────────────────────────
 # Persistence (SessionDB state_meta)
@@ -1213,6 +1389,134 @@ class GoalManager:
         self._state.last_reason = reason
         save_goal(self.session_id, self._state)
 
+    # --- structured /goal controls -------------------------------------
+
+    def ensure_structured_goal(self) -> StructuredGoalState:
+        """Create or load this goal's filesystem-backed structured state."""
+        if self._state is None or self._state.status == "cleared":
+            raise RuntimeError("no active goal")
+        if self._state.structured_goal_path:
+            loaded = load_structured_goal(self._state.structured_goal_path)
+            if loaded is not None:
+                return loaded
+        if not self.has_goal():
+            raise RuntimeError("no active goal")
+        structured = create_structured_goal(self.session_id, self._state.goal)
+        self._state.structured_goal_id = structured.goal_id
+        self._state.structured_goal_path = structured.path
+        save_goal(self.session_id, self._state)
+        return structured
+
+    def structured_status(self) -> str:
+        structured = self.ensure_structured_goal()
+        return structured_goal_summary(structured)
+
+    def start_round(self, prompt: str = "") -> StructuredGoalRound:
+        structured = self.ensure_structured_goal()
+        if structured.current and structured.current.status == "active":
+            structured.current.status = "closed"
+        number = (max((r.number for r in structured.rounds), default=0) + 1)
+        round_dir = Path(structured.path) / "rounds" / f"{number:03d}"
+        round_dir.mkdir(parents=True, exist_ok=True)
+        round_state = StructuredGoalRound(
+            number=number,
+            status="active",
+            created_at=time.time(),
+            prompt_path=str(round_dir / "prompt.md"),
+            evidence_path=str(round_dir / "evidence.md"),
+            reviewer_path=str(round_dir / "reviewer.md"),
+            decision_path=str(round_dir / "decision.json"),
+        )
+        (round_dir / "prompt.md").write_text((prompt or self._state.goal).rstrip() + "\n", encoding="utf-8")
+        (round_dir / "evidence.md").write_text(f"# Evidence — round {number:03d}\n\n", encoding="utf-8")
+        (round_dir / "reviewer.md").write_text(f"# Reviewer — round {number:03d}\n\n", encoding="utf-8")
+        structured.rounds.append(round_state)
+        structured.current_round = number
+        save_structured_goal(structured)
+        return round_state
+
+    def _current_round_or_create(self) -> tuple[StructuredGoalState, StructuredGoalRound]:
+        structured = self.ensure_structured_goal()
+        current = structured.current
+        if current is None or current.status != "active":
+            current = self.start_round()
+            structured = self.ensure_structured_goal()
+            current = structured.current
+        assert current is not None
+        return structured, current
+
+    def add_evidence(self, evidence: str) -> StructuredGoalRound:
+        evidence = (evidence or "").strip()
+        if not evidence:
+            raise ValueError("evidence text/path/url is empty")
+        structured, current = self._current_round_or_create()
+        timestamp = datetime.now(tz=timezone.utc).isoformat()
+        _append_markdown(Path(current.evidence_path), f"## {timestamp}\n\n{evidence}\n")
+        current.evidence_count += 1
+        save_structured_goal(structured)
+        return current
+
+    def set_reviewer(self, status: str, note: str = "") -> StructuredGoalRound:
+        status = (status or "").strip().lower().replace("-", "_")
+        if status not in STRUCTURED_GOAL_REVIEWER_STATUSES:
+            raise ValueError("reviewer must be one of: pass, fail, needs_work")
+        structured, current = self._current_round_or_create()
+        timestamp = datetime.now(tz=timezone.utc).isoformat()
+        _append_markdown(Path(current.reviewer_path), f"## {timestamp} — {status}\n\n{(note or '').strip()}\n")
+        current.reviewer_status = status
+        save_structured_goal(structured)
+        return current
+
+    def record_decision(self, decision: str, note: str = "", *, force: bool = False) -> Dict[str, Any]:
+        decision = (decision or "").strip().lower().replace("-", "_")
+        if decision not in STRUCTURED_GOAL_DECISIONS:
+            raise ValueError("decision must be one of: complete, continue, blocked, needs_human")
+        structured, current = self._current_round_or_create()
+        if decision == "complete" and not force:
+            if structured.reviewer_required and current.reviewer_status != "pass":
+                raise RuntimeError("complete requires reviewer pass (or --force)")
+            if current.evidence_count < 1:
+                raise RuntimeError("complete requires at least one evidence entry (or --force)")
+        payload = {
+            "decision": decision,
+            "note": (note or "").strip(),
+            "forced": bool(force),
+            "round": current.number,
+            "created_at": datetime.now(tz=timezone.utc).isoformat(),
+            "evidence_count": current.evidence_count,
+            "reviewer_status": current.reviewer_status,
+        }
+        _write_json(Path(current.decision_path), payload)
+        current.decision = decision
+        current.status = "closed" if decision in {"complete", "blocked", "needs_human"} else "active"
+        if decision == "complete":
+            structured.status = "complete"
+            if self._state is not None:
+                self._state.status = "done"
+                self._state.last_verdict = "done"
+                self._state.last_reason = note or "structured goal marked complete"
+                save_goal(self.session_id, self._state)
+        elif decision in {"blocked", "needs_human"}:
+            structured.status = decision
+            if self._state is not None:
+                self._state.status = "paused"
+                self._state.paused_reason = decision
+                save_goal(self.session_id, self._state)
+        else:
+            structured.status = "active"
+            if self._state is not None:
+                self._state.status = "active"
+                self._state.paused_reason = None
+                save_goal(self.session_id, self._state)
+        save_structured_goal(structured)
+        report = Path(structured.path) / "report.md"
+        _append_markdown(report, f"## Round {current.number:03d} decision — {decision}\n\n{payload['note']}\n")
+        return payload
+
+    def report_path(self) -> str:
+        structured = self.ensure_structured_goal()
+        return str(Path(structured.path) / "report.md")
+
     # --- /subgoal user controls ---------------------------------------
 
     def add_subgoal(self, text: str) -> str:
@@ -1746,6 +2050,8 @@ __all__ = [
     "GoalManager",
     "parse_contract",
     "draft_contract",
+    "StructuredGoalState",
+    "StructuredGoalRound",
     "CONTINUATION_PROMPT_TEMPLATE",
     "CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE",
     "CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE",
@@ -1760,6 +2066,9 @@ __all__ = [
     "save_goal",
     "clear_goal",
     "migrate_goal_to_session",
+    "load_structured_goal",
+    "save_structured_goal",
+    "create_structured_goal",
     "judge_goal",
     "run_kanban_goal_loop",
 ]
