@@ -471,21 +471,29 @@ def _chat_messages_to_responses_input(
                         items.append(replay_item)
                         replayed_message_items += 1
 
+                tool_calls = msg.get("tool_calls")
+                has_tool_calls = isinstance(tool_calls, list) and any(
+                    isinstance(tc, dict)
+                    and isinstance(tc.get("function", {}).get("name"), str)
+                    and tc.get("function", {}).get("name").strip()
+                    for tc in tool_calls
+                )
+
                 if replayed_message_items > 0:
                     pass
                 elif content_parts:
                     items.append({"role": "assistant", "content": content_parts})
                 elif content_text.strip():
                     items.append({"role": "assistant", "content": content_text})
-                elif has_codex_reasoning:
+                elif has_codex_reasoning and not has_tool_calls:
                     # The Responses API requires a following item after each
                     # reasoning item (otherwise: missing_following_item error).
-                    # When the assistant produced only reasoning with no visible
-                    # content, emit an empty assistant message as the required
-                    # following item.
+                    # A structured function_call already satisfies that contract.
+                    # Emitting an extra empty assistant content item before the
+                    # function_call makes the Codex backend reject long tool-only
+                    # runs with HTTP 400 "Unsupported content type".
                     items.append({"role": "assistant", "content": ""})
 
-                tool_calls = msg.get("tool_calls")
                 if isinstance(tool_calls, list):
                     for tc in tool_calls:
                         if not isinstance(tc, dict):
