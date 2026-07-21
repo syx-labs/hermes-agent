@@ -30,10 +30,14 @@ from concurrent.futures import (
 )
 from typing import Any, Dict, List, Optional
 
-from toolsets import TOOLSETS
+from toolsets import TOOLSETS, resolve_multiple_toolsets
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
+from tools.delegation_autolaunch_policy import (
+    build_delegate_auto_launch_request,
+    decide_auto_launch,
+)
 
 
 # Tools that children must never have access to
@@ -644,6 +648,50 @@ def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
     return [t for t in toolsets if t not in blocked_toolset_names]
 
 
+def _resolve_effective_child_toolsets(
+    parent_agent,
+    requested_toolsets: Optional[List[str]],
+    *,
+    role: str,
+) -> List[str]:
+    """Resolve the exact toolsets a child would receive before construction."""
+    parent_enabled = getattr(parent_agent, "enabled_toolsets", None)
+    if parent_enabled is not None:
+        parent_toolsets = set(parent_enabled)
+    elif parent_agent and hasattr(parent_agent, "valid_tool_names"):
+        import model_tools
+
+        parent_toolsets = {
+            ts
+            for name in parent_agent.valid_tool_names
+            if (ts := model_tools.get_toolset_for_tool(name)) is not None
+        }
+    else:
+        parent_toolsets = set(DEFAULT_TOOLSETS)
+
+    if requested_toolsets:
+        child_toolsets = [t for t in requested_toolsets if t in parent_toolsets]
+        if _get_inherit_mcp_toolsets():
+            child_toolsets = _preserve_parent_mcp_toolsets(
+                child_toolsets, parent_toolsets
+            )
+        child_toolsets = _strip_blocked_tools(child_toolsets)
+    elif parent_agent and parent_enabled is not None:
+        child_toolsets = _strip_blocked_tools(list(parent_enabled))
+    elif parent_toolsets:
+        child_toolsets = _strip_blocked_tools(sorted(parent_toolsets))
+    else:
+        child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
+
+    child_depth = getattr(parent_agent, "_delegate_depth", 0) + 1
+    max_spawn = _get_max_spawn_depth()
+    orchestrator_ok = _get_orchestrator_enabled() and child_depth < max_spawn
+    effective_role = role if (role == "orchestrator" and orchestrator_ok) else "leaf"
+    if effective_role == "orchestrator" and "delegation" not in child_toolsets:
+        child_toolsets.append("delegation")
+    return child_toolsets
+
+
 def _build_child_progress_callback(
     task_index: int,
     goal: str,
@@ -887,46 +935,10 @@ def _build_child_agent(
 
     delegation_cfg = _load_config()
 
-    # When no explicit toolsets given, inherit from parent's enabled toolsets
-    # so disabled tools (e.g. web) don't leak to subagents.
-    # Note: enabled_toolsets=None means "all tools enabled" (the default),
-    # so we must derive effective toolsets from the parent's loaded tools.
-    parent_enabled = getattr(parent_agent, "enabled_toolsets", None)
-    if parent_enabled is not None:
-        parent_toolsets = set(parent_enabled)
-    elif parent_agent and hasattr(parent_agent, "valid_tool_names"):
-        # enabled_toolsets is None (all tools) — derive from loaded tool names
-        import model_tools
-
-        parent_toolsets = {
-            ts
-            for name in parent_agent.valid_tool_names
-            if (ts := model_tools.get_toolset_for_tool(name)) is not None
-        }
-    else:
-        parent_toolsets = set(DEFAULT_TOOLSETS)
-
-    if toolsets:
-        # Intersect with parent — subagent must not gain tools the parent lacks
-        child_toolsets = [t for t in toolsets if t in parent_toolsets]
-        if _get_inherit_mcp_toolsets():
-            child_toolsets = _preserve_parent_mcp_toolsets(
-                child_toolsets, parent_toolsets
-            )
-        child_toolsets = _strip_blocked_tools(child_toolsets)
-    elif parent_agent and parent_enabled is not None:
-        child_toolsets = _strip_blocked_tools(parent_enabled)
-    elif parent_toolsets:
-        child_toolsets = _strip_blocked_tools(sorted(parent_toolsets))
-    else:
-        child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
-
-    # Orchestrators retain the 'delegation' toolset that _strip_blocked_tools
-    # removed.  The re-add is unconditional on parent-toolset membership because
-    # orchestrator capability is granted by role, not inherited — see the
-    # test_intersection_preserves_delegation_bound test for the design rationale.
-    if effective_role == "orchestrator" and "delegation" not in child_toolsets:
-        child_toolsets.append("delegation")
+    # Resolve exactly the same effective child toolsets used by the optional
+    # pre-spawn auto-launch policy gate. Keep this in one helper so the gate
+    # cannot approve a narrower request than the child actually receives.
+    child_toolsets = _resolve_effective_child_toolsets(parent_agent, toolsets, role=role)
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
     child_prompt = _build_child_system_prompt(
@@ -1288,11 +1300,15 @@ def _run_single_child(
     _stale_count = [0]
 
     def _heartbeat_loop():
-        while not _heartbeat_stop.wait(_HEARTBEAT_INTERVAL):
+        while not _heartbeat_stop.is_set():
             if parent_agent is None:
+                if _heartbeat_stop.wait(_HEARTBEAT_INTERVAL):
+                    break
                 continue
             touch = getattr(parent_agent, "_touch_activity", None)
             if not touch:
+                if _heartbeat_stop.wait(_HEARTBEAT_INTERVAL):
+                    break
                 continue
             # Pull detail from the child's own activity tracker
             desc = f"delegate_task: subagent {task_index} working"
@@ -1355,8 +1371,21 @@ def _run_single_child(
                 touch(desc)
             except Exception:
                 pass
+            if _heartbeat_stop.wait(_HEARTBEAT_INTERVAL):
+                break
 
     _heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+    # Touch the parent immediately as delegation begins. The background loop
+    # still owns stale detection, but waiting a full interval before the first
+    # heartbeat is both less useful operationally and flaky in short-duration
+    # regression tests because thread startup can consume part of the window.
+    if parent_agent is not None:
+        touch = getattr(parent_agent, "_touch_activity", None)
+        if touch:
+            try:
+                touch(f"delegate_task: subagent {task_index} started")
+            except Exception:
+                pass
     _heartbeat_thread.start()
 
     # Register the live agent in the module-level registry so the TUI can
@@ -1765,6 +1794,13 @@ def _run_single_child(
         # after the child has finished (or failed).
         _heartbeat_stop.set()
         _heartbeat_thread.join(timeout=5)
+        if parent_agent is not None:
+            touch = getattr(parent_agent, "_touch_activity", None)
+            if touch:
+                try:
+                    touch(f"delegate_task: subagent {task_index} finished")
+                except Exception:
+                    pass
 
         # Drop the TUI-facing registry entry.  Safe to call even if the
         # child was never registered (e.g. ID missing on test doubles).
@@ -1917,6 +1953,49 @@ def delegate_task(
     for i, task in enumerate(task_list):
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+
+    # Optional Warp-derived safety gate: when enabled, a model-emitted
+    # delegate_task request must match an approved conversation/task-scoped
+    # orchestration config before any child agents are constructed.  Disabled
+    # by default until callers persist per-conversation configs.
+    if is_truthy_value(cfg.get("require_approved_config_for_auto_launch"), default=False):
+        effective_toolsets = []
+        resolved_tool_names = []
+        for task in task_list:
+            task_toolsets = task.get("toolsets") or toolsets
+            effective_role = _normalize_role(task.get("role") or top_role)
+            child_toolsets = _resolve_effective_child_toolsets(
+                parent_agent, task_toolsets, role=effective_role
+            )
+            effective_toolsets.extend(child_toolsets)
+            resolved_tool_names.extend(resolve_multiple_toolsets(child_toolsets))
+        request = build_delegate_auto_launch_request(
+            conversation_id=getattr(parent_agent, "session_id", None),
+            task_id=(
+                getattr(parent_agent, "_current_task_id", None)
+                or getattr(parent_agent, "task_id", None)
+            ),
+            model_id=creds.get("model") or getattr(parent_agent, "model", None),
+            harness_type="hermes-delegate",
+            task_count=len(task_list),
+            timeout_sec=_get_child_timeout(),
+            tools=effective_toolsets,
+            tool_names=resolved_tool_names,
+            skills=[],
+        )
+        decision = decide_auto_launch(request, cfg.get("approved_config"))
+        if not decision.get("allowed"):
+            logger.warning(
+                "delegate_task auto-launch denied: reason=%s effective=%s",
+                decision.get("reason"),
+                decision.get("effective_values"),
+            )
+            return tool_error(
+                "Delegation auto-launch denied by approved-config policy: "
+                f"{decision.get('reason')}. Approve a conversation-scoped "
+                "delegation.approved_config or disable "
+                "delegation.require_approved_config_for_auto_launch."
+            )
 
     overall_start = time.monotonic()
     results = []

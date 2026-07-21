@@ -963,6 +963,12 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        # Optional fail-closed auto-launch gate for model-emitted delegation.
+        # Disabled by default to preserve existing delegate_task behavior while
+        # conversation-scoped config persistence is rolled out. When enabled,
+        # delegate_task must match delegation.approved_config before spawning.
+        "require_approved_config_for_auto_launch": False,
+        "approved_config": {},
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
