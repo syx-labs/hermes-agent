@@ -108,7 +108,9 @@ def _get_webhook_base_url() -> str:
         port = int(raw_port)
     except (TypeError, ValueError):
         port = 8644
-    display_host = "localhost" if host == "0.0.0.0" else host
+    display_host = "localhost" if not host or host in {"0.0.0.0", "::"} else host
+    if ":" in display_host and not display_host.startswith("["):
+        display_host = f"[{display_host}]"
     return f"http://{display_host}:{port}"
 
 
@@ -125,7 +127,6 @@ def _setup_hint() -> str:
        webhook:
          enabled: true
          extra:
-           host: "0.0.0.0"
            port: 8644
            secret: "your-global-hmac-secret"
 
