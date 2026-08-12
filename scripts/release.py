@@ -736,7 +736,7 @@ LEGACY_AUTHOR_MAP = {
     "zhekinmaksim@gmail.com": "Zhekinmaksim",
     "obafemiferanmi1999@gmail.com": "KvnGz",
     "shadowlynx.labs@gmail.com": "syx-labs",
-    "alpha@syx-labs.local": "syx-labs",  # ADR 0015 resync-routine commit identity
+    "alpha@syx-labs.local": "syx-labs",  # Alpha automation + ADR 0015 resync-routine identity
     "159539633+MottledShadow@users.noreply.github.com": "MottledShadow",
     "aludwin+gh@gmail.com": "adamludwin",
     "ngusev@astralinux.ru": "NikolayGusev-astra",
