@@ -17412,10 +17412,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # wait/unwait barrier verbs which take a pid argument and the
         # gate management verb (inspection/mutation of the gate list only —
         # gates run at turn boundary, so editing them mid-run is safe).
+        # Fork: the structured-goal verbs (structured/round/evidence/reviewer/
+        # decision/report) only read/write the goal store via GoalManager and
+        # never inject a prompt into the running turn, so they are control-plane
+        # too — and mid-run is precisely when a round's evidence gets recorded.
+        # ``structured``/``report`` are exact-match in the handler (anything
+        # after them would be treated as a new goal text), so they stay in the
+        # exact set; the other four take arguments and dispatch on the verb.
         _is_control = (
             not _goal_arg
-            or _goal_arg in {"status", "pause", "resume", "clear", "stop", "done", "unwait"}
-            or _goal_verb in {"wait", "gate"}
+            or _goal_arg in {
+                "status", "pause", "resume", "clear", "stop", "done", "unwait",
+                "structured", "structured status", "report",
+            }
+            or _goal_verb in {"wait", "gate", "round", "evidence", "reviewer", "decision"}
         )
         if _is_control:
             return await self._handle_goal_command(event)
